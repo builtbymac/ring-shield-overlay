@@ -1,0 +1,49 @@
+name: CI — Relay & Android TV PoC
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  relay:
+    name: Relay (TypeScript build & test)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: relay
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: relay/package-lock.json
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run build
+      - run: npm test
+
+  android-poc:
+    name: Android TV PoC (arm64-v8a APK)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+      - name: Build arm64-v8a Debug APK
+        working-directory: android-poc
+        run: gradle --no-daemon assembleDebug
+      - name: Upload PoC APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ring-shield-poc-arm64-debug
+          path: android-poc/app/build/outputs/apk/debug/app-debug.apk
+          retention-days: 30

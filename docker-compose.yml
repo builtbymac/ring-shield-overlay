@@ -1,0 +1,26 @@
+services:
+  relay:
+    build:
+      context: ./relay
+    container_name: ring-shield-relay
+    restart: unless-stopped
+    env_file:
+      - ./relay/.env
+    ports:
+      - "8787:8787"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8787/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # Optional: expose POST /api/webhook over HTTPS to Ring Cloud via Cloudflare Tunnel.
+  # Start with: docker compose --profile tunnel up -d
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: ring-shield-tunnel
+    profiles: ["tunnel"]
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN}
+    depends_on:
+      - relay

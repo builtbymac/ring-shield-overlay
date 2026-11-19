@@ -1,0 +1,35 @@
+# Environment & secrets (never commit!)
+.env
+.env.local
+.env.*.local
+*.key
+*.pem
+*.jks
+*.keystore
+config.json
+
+# Node / Relay
+relay/node_modules/
+relay/dist/
+npm-debug.log*
+
+# Android / Gradle
+android-poc/.gradle/
+android-poc/.idea/
+android-poc/local.properties
+android-poc/build/
+android-poc/app/build/
+android-poc/out/
+*.apk
+*.aab
+*.iml
+
+# Benchmark outputs & logs
+benchmarks/
+*.jsonl
+*.csv
+
+# OS / Editor
+.DS_Store
+Thumbs.db
+.vscode/
