@@ -60,7 +60,12 @@ class DoorbellOverlayService : Service() {
             onEvent = { ev -> scope.launch { handleRelayEvent(ev) } },
             onConnectionChanged = { connected ->
                 isRelayConnected = connected
-                if (!connected && !relay.isStopped) scheduleReconnect()
+                if (connected) {
+                    reconnectJob?.cancel()
+                    reconnectJob = null
+                } else if (!relay.isStopped) {
+                    scheduleReconnect()
+                }
             }
         )
 

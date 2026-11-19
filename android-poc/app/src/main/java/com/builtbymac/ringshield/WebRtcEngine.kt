@@ -153,13 +153,15 @@ class WebRtcEngine(
         )
 
         val offer = createOfferSuspend(pc)
-        val mungedSdp = if (cfg.stripTwcc) stripTwccFromSdp(offer.description) else offer.description
-        setLocalDescriptionSuspend(pc, SessionDescription(offer.type, mungedSdp))
+        // Always pass the exact unmodified offer to setLocalDescription (libwebrtc Unified Plan
+        // rejects SDP mutations like removed extmap/empty lines on setLocalDescription).
+        setLocalDescriptionSuspend(pc, offer)
 
         // Wait briefly for first srflx candidate or completion (capped by iceGatherBudgetMs)
         withTimeoutOrNull(cfg.iceGatherBudgetMs) { srflxOrComplete.await() }
 
-        val finalSdp = pc.localDescription?.description ?: mungedSdp
+        val gatheredSdp = pc.localDescription?.description ?: offer.description
+        val finalSdp = if (cfg.stripTwcc) stripTwccFromSdp(gatheredSdp) else gatheredSdp
         return PrewarmedOffer(
             peerConnection = pc,
             sdpOffer = finalSdp,
@@ -243,10 +245,9 @@ class WebRtcEngine(
          */
         fun stripTwccFromSdp(sdp: String): String =
             sdp.lineSequence()
-                .filterNot { line ->
-                    line.contains("rtcp-fb:") && line.contains("transport-cc") ||
-                        line.contains("http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions")
-                }
+                .map { it.trimEnd('\r') }
+                .filter { it.isNotEmpty() }
+                .filterNot { line -> line.contains("rtcp-fb:") && line.contains("transport-cc") }
                 .joinToString("\r\n") + "\r\n"
     }
 }

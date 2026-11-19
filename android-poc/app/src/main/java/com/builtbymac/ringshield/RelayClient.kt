@@ -41,6 +41,7 @@ class RelayClient(
 
     @Volatile private var ws: WebSocket? = null
     @Volatile private var stopped = false
+    private val connSeq = java.util.concurrent.atomic.AtomicLong(0)
 
     fun connect() {
         stopped = false
@@ -52,14 +53,20 @@ class RelayClient(
         val reqBuilder = Request.Builder().url(url)
         cfg.lanToken?.let { reqBuilder.header("Authorization", "Bearer $it") }
 
-        ws?.close(1000, "reconnecting")
+        val mySeq = connSeq.incrementAndGet()
+        val oldWs = ws
+        ws = null
+        oldWs?.close(1000, "reconnecting")
+
         ws = http.newWebSocket(reqBuilder.build(), object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
+                if (mySeq != connSeq.get()) return
                 Log.i(TAG, "Connected to relay WebSocket: $wsBase/ws")
                 onConnectionChanged(true)
             }
 
             override fun onMessage(webSocket: WebSocket, text: String) {
+                if (mySeq != connSeq.get()) return
                 runCatching {
                     val root = JSONObject(text)
                     if (root.optString("kind") != "ring_event") return
@@ -78,11 +85,13 @@ class RelayClient(
             }
 
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+                if (mySeq != connSeq.get()) return
                 Log.w(TAG, "Relay WS closed ($code): $reason")
                 onConnectionChanged(false)
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                if (mySeq != connSeq.get()) return
                 Log.e(TAG, "Relay WS error: ${t.message}")
                 onConnectionChanged(false)
             }
