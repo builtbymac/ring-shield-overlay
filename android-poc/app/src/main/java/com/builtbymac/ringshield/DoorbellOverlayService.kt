@@ -39,12 +39,14 @@ class DoorbellOverlayService : Service() {
     private var reconnectJob: Job? = null
     private var prewarmExpiryJob: Job? = null
     private var activeSessionJob: Job? = null
+    private var rolloverJob: Job? = null
 
     private var prewarmedOffer: PrewarmedOffer? = null
     private var activeOffer: PrewarmedOffer? = null
     private var activeVideoTrack: org.webrtc.VideoTrack? = null
     private var activeRenderer: TextureViewRenderer? = null
     private var activeSessionUrl: String? = null
+    private var activeDeviceId: String? = null
 
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
 
@@ -152,6 +154,7 @@ class DoorbellOverlayService : Service() {
                 synthetic = true,
             ),
             startFullscreen = startFullscreen,
+            keepAliveUntilDismissed = true,
         )
     }
 
@@ -214,7 +217,11 @@ class DoorbellOverlayService : Service() {
         prewarmedOffer = null
     }
 
-    private fun startDoorbellOverlay(event: RelayRingEvent, startFullscreen: Boolean = false) {
+    private fun startDoorbellOverlay(
+        event: RelayRingEvent,
+        startFullscreen: Boolean = false,
+        keepAliveUntilDismissed: Boolean = false,
+    ) {
         activeSessionJob?.cancel()
         stopActiveStream()
 
@@ -223,6 +230,7 @@ class DoorbellOverlayService : Service() {
             Log.e(TAG, "No deviceId in event or config.json; cannot start WHEP stream")
             return
         }
+        activeDeviceId = deviceId
 
         val freshPrewarm = prewarmedOffer?.takeIf {
             SystemClock.elapsedRealtime() - it.createdAtMonoMs <= cfg.prewarmTtlMs
@@ -252,6 +260,7 @@ class DoorbellOverlayService : Service() {
                     cfg = cfg,
                     eglContext = webrtc.eglBase.eglBaseContext,
                     startFullscreen = startFullscreen,
+                    keepAliveUntilDismissed = keepAliveUntilDismissed,
                     onFirstFrameVisible = {
                         val now = SystemClock.elapsedRealtime()
                         if (trial.firstFrameMonoMs == null) {
@@ -260,6 +269,9 @@ class DoorbellOverlayService : Service() {
                             trial.success = true
                             latencyLogger.record(trial)
                         }
+                    },
+                    onKeepAliveActivated = {
+                        armSeamlessRollover(deviceId)
                     },
                     onAutoDismiss = {
                         if (!trial.success && trial.error == null) {
@@ -292,6 +304,10 @@ class DoorbellOverlayService : Service() {
 
                 // Track ICE connection time for telemetry
                 trial.iceConnectedMonoMs = withTimeout(10_000L) { offer.iceConnectedDeferred.await() }
+
+                if (overlayManager.isKeepAlive) {
+                    armSeamlessRollover(deviceId)
+                }
 
                 // Log detailed inbound-rtp jitter/freeze/loss stats every 4 s for diagnostics
                 repeat(5) { sampleIdx ->
@@ -329,7 +345,77 @@ class DoorbellOverlayService : Service() {
         }
     }
 
+    /**
+     * Ring battery doorbells cap individual WHEP sessions at 30 s.
+     * When the user has chosen to keep watching (on-demand or expanded to fullscreen),
+     * silently open a replacement WHEP session every 24 s in the background and hot-swap
+     * the VideoSink on the first decoded frame so playback continues seamlessly until Back!
+     */
+    private fun armSeamlessRollover(deviceId: String) {
+        if (rolloverJob?.isActive == true) return
+        rolloverJob = scope.launch {
+            while (overlayManager.isShowing && overlayManager.isKeepAlive) {
+                delay(24_000L)
+                if (!overlayManager.isShowing || !overlayManager.isKeepAlive) break
+                val renderer = activeRenderer ?: break
+
+                Log.i(TAG, "Keep-alive active: preparing seamless background WHEP rollover...")
+                var nextOffer: PrewarmedOffer? = null
+                var nextSessionUrl: String? = null
+                try {
+                    nextOffer = webrtc.prepareOffer(cfg)
+                    val answer = relay.startWhep(deviceId, nextOffer.sdpOffer)
+                    nextSessionUrl = answer.sessionUrl
+                    webrtc.applyAnswer(nextOffer, answer.sdpAnswer, cfg.stripTwcc)
+
+                    val nextTrack = withTimeout(8_000L) { nextOffer.videoTrackDeferred.await() }
+                    val firstFrameReady = kotlinx.coroutines.CompletableDeferred<Unit>()
+                    val probeSink = org.webrtc.VideoSink { _ -> firstFrameReady.complete(Unit) }
+                    withContext(Dispatchers.Main.immediate) {
+                        nextTrack.addSink(probeSink)
+                    }
+                    withTimeout(8_000L) { firstFrameReady.await() }
+
+                    // Atomic hot-swap onto the existing TextureViewRenderer with zero black screen!
+                    val oldTrack = activeVideoTrack
+                    val oldOffer = activeOffer
+                    val oldSessionUrl = activeSessionUrl
+
+                    withContext(Dispatchers.Main.immediate) {
+                        if (!overlayManager.isShowing) {
+                            nextTrack.removeSink(probeSink)
+                            webrtc.closeOffer(nextOffer)
+                            nextSessionUrl?.let { scope.launch { relay.stopWhep(it) } }
+                            return@withContext
+                        }
+                        oldTrack?.let { runCatching { it.removeSink(renderer) } }
+                        nextTrack.removeSink(probeSink)
+                        nextTrack.addSink(renderer)
+                        activeVideoTrack = nextTrack
+                        activeOffer = nextOffer
+                        activeSessionUrl = nextSessionUrl
+                    }
+
+                    webrtc.closeOffer(oldOffer)
+                    if (oldSessionUrl != null) {
+                        scope.launch { relay.stopWhep(oldSessionUrl) }
+                    }
+                    Log.i(TAG, "Seamless WHEP rollover complete — continuous live viewing active")
+                } catch (ex: Throwable) {
+                    Log.w(TAG, "Background WHEP rollover failed: ${ex.message}")
+                    webrtc.closeOffer(nextOffer)
+                    nextSessionUrl?.let { scope.launch { relay.stopWhep(it) } }
+                    delay(2_000L)
+                }
+            }
+        }
+    }
+
     private fun stopActiveStream() {
+        rolloverJob?.cancel()
+        rolloverJob = null
+        activeDeviceId = null
+
         val track = activeVideoTrack
         val rend = activeRenderer
         activeVideoTrack = null

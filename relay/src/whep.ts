@@ -22,6 +22,11 @@ export async function startWhepSession(
   const token = await auth.getAccessToken()
   const whepUrl = `${RING_API_BASE}/v1/devices/${encodeURIComponent(deviceId)}/media/streaming/whep/sessions`
 
+  const offerSummary = sdpOffer
+    .split(/\r?\n/)
+    .filter((l) => /^(m=|a=rtpmap:|a=fmtp:)/.test(l))
+  console.log(`[whep] Offer SDP summary (${offerSummary.length} lines):\n  ${offerSummary.slice(0, 14).join('\n  ')}`)
+
   const t0 = performance.now()
   const res = await undiciFetch(whepUrl, {
     method: 'POST',
@@ -73,7 +78,7 @@ export async function stopWhepSession(
 
 export async function discoverDevices(auth: RingAuthManager): Promise<unknown[]> {
   const token = await auth.getAccessToken()
-  const res = await undiciFetch(`${RING_API_BASE}/v1/devices`, {
+  const res = await undiciFetch(`${RING_API_BASE}/v1/devices?include=status,capabilities,configurations`, {
     method: 'GET',
     headers: { ...RING_CLIENT_HEADERS, Authorization: `Bearer ${token}` },
     dispatcher: upstreamAgent,
@@ -82,12 +87,21 @@ export async function discoverDevices(auth: RingAuthManager): Promise<unknown[]>
     const errText = await res.text()
     throw new Error(`Device discovery failed (${res.status}): ${errText}`)
   }
-  const body = (await res.json()) as { data?: any[] }
+  const body = (await res.json()) as { data?: any[]; included?: any[] }
+  const incByKey = new Map<string, any>()
+  for (const item of body.included ?? []) {
+    incByKey.set(`${item.type}:${item.id}`, item.attributes ?? {})
+  }
+  const lookup = (rel: any) => {
+    const ref = rel?.data
+    return ref ? incByKey.get(`${ref.type}:${ref.id}`) ?? {} : {}
+  }
   return (body.data ?? []).map((d) => ({
     id: d.id,
     name: d.attributes?.name ?? d.attributes?.description ?? 'Ring Device',
-    online: d.attributes?.online ?? null,
-    capabilities: d.attributes?.capabilities ?? {},
+    status: lookup(d.relationships?.status),
+    capabilities: lookup(d.relationships?.capabilities),
+    configurations: lookup(d.relationships?.configurations),
     rawType: d.type,
   }))
 }
