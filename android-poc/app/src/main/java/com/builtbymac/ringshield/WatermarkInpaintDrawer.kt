@@ -9,8 +9,8 @@ package org.webrtc
 object WatermarkInpaintDrawerFactory {
 
     fun create(): RendererCommon.GlDrawer = object : GlGenericDrawer(
-        INPAINT_FRAGMENT_SHADER,
         INPAINT_VERTEX_SHADER,
+        INPAINT_FRAGMENT_SHADER,
         object : ShaderCallbacks {
             override fun onNewShader(shader: GlShader) = Unit
 
