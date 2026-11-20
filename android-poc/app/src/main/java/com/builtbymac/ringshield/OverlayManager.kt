@@ -17,30 +17,29 @@ import android.view.Gravity
 import android.view.KeyEvent
 import android.view.View
 import android.view.ViewOutlineProvider
+import android.view.ViewTreeObserver
 import android.view.WindowManager
 import android.view.animation.PathInterpolator
 import android.widget.FrameLayout
-import androidx.dynamicanimation.animation.DynamicAnimation
-import androidx.dynamicanimation.animation.SpringAnimation
-import androidx.dynamicanimation.animation.SpringForce
 import org.webrtc.EglBase
 
 /**
- * Sleek, pure-video TV overlay for Nvidia Shield Pro.
+ * Apple TV HomeKit-style pure-video overlay for Nvidia Shield Pro.
  *
- * True 60 fps GPU animations with zero WindowManager jitter:
- *  - Entrance: Real physics SpringAnimation gliding out from the corner edge inside a
- *    generously padded transparent WindowManager host so nothing ever clips.
- *  - PiP <-> Fullscreen morph: Single atomic WindowManager expansion to full-screen
- *    followed by a pure GPU transform-matrix animation (scaleX/scaleY/translationX/translationY)
- *    + backdrop scrim fade at locked 60 fps — zero per-frame wm.updateViewLayout() reallocations!
- *  - Continuous viewing: When user-initiated or expanded to fullscreen, auto-dismiss is
- *    cancelled so the stream stays open until the user presses Back or Dismiss.
+ * Zero-glitch animation architecture:
+ *  - Entrance / Exit: Synchronized single ViewPropertyAnimator (gentle 20 dp vertical lift +
+ *    subtle 0.96->1.0 scale + alpha) with Apple ease-out curve (0.16, 1, 0.3, 1), running inside
+ *    a padded transparent WindowManager host so nothing ever clips.
+ *  - PiP <-> Fullscreen: Waits for OnPreDrawListener AFTER WindowManager finishes resizing
+ *    before setting the exact initial GPU transform matrix (scaleX/scaleY/translationX/translationY)
+ *    — guaranteeing pixel-exact frame 1 with zero jump, zero postage-stamp shrink, and locked 60 fps!
+ *  - Continuous viewing: On-demand or expanded fullscreen cancels auto-dismiss until Back/Dismiss.
  */
 class OverlayManager(private val context: Context) {
 
     private val wm = context.getSystemService(Context.WINDOW_SERVICE) as WindowManager
     private val mainHandler = Handler(Looper.getMainLooper())
+    private val appleEaseOut = PathInterpolator(0.16f, 1f, 0.3f, 1f)
     private val morphEase = PathInterpolator(0.22f, 1f, 0.36f, 1f)
     private val exitEase = PathInterpolator(0.4f, 0f, 1f, 1f)
 
@@ -55,7 +54,6 @@ class OverlayManager(private val context: Context) {
 
     private var dotAnimator: ObjectAnimator? = null
     private var cornerAnimator: ValueAnimator? = null
-    private var activeSprings = mutableListOf<SpringAnimation>()
     private var dismissRunnable: Runnable? = null
     private var onDismissCallback: (() -> Unit)? = null
     private var onKeepAliveCallback: (() -> Unit)? = null
@@ -142,7 +140,7 @@ class OverlayManager(private val context: Context) {
 
         val scrim = View(context).apply {
             setBackgroundColor(Color.BLACK)
-            alpha = if (startFullscreen) 0f else 0f
+            alpha = 0f
             visibility = if (startFullscreen) View.VISIBLE else View.GONE
         }
         scrimView = scrim
@@ -156,7 +154,7 @@ class OverlayManager(private val context: Context) {
 
         val card = FrameLayout(context).apply {
             alpha = 0f
-            elevation = if (startFullscreen) 0f else dp(18).toFloat()
+            elevation = if (startFullscreen) 0f else dp(16).toFloat()
             background = bg
             outlineProvider = object : ViewOutlineProvider() {
                 override fun getOutline(view: View, outline: Outline) {
@@ -173,7 +171,7 @@ class OverlayManager(private val context: Context) {
                 onFirstFrame = {
                     mainHandler.post {
                         if (hostWindow === host && !isHiding) {
-                            animateSpringEntrance(card, scrim, cfg, startFullscreen)
+                            animateEntrance(card, scrim, startFullscreen)
                             onFirstFrameVisible()
                         }
                     }
@@ -241,7 +239,6 @@ class OverlayManager(private val context: Context) {
         if (!isKeepAlive) {
             scheduleAutoDismiss(cfg.overlayDurationSec * 1000L)
         } else {
-            // Safety ceiling (5 min) so an unattended TV doesn't drain battery overnight
             scheduleAutoDismiss(KEEP_ALIVE_SAFETY_CAP_MS)
         }
 
@@ -256,8 +253,9 @@ class OverlayManager(private val context: Context) {
     }
 
     /**
-     * Smooth 60 fps GPU transform-matrix PiP <-> Fullscreen morph.
-     * Zero per-frame wm.updateViewLayout() calls!
+     * Pixel-exact 60 fps GPU PiP <-> Fullscreen morph.
+     * Uses OnPreDrawListener so WindowManager layout finishes BEFORE frame 1 draws —
+     * eliminating any postage-stamp shrink or coordinate jump!
      */
     fun setFullscreen(expand: Boolean) {
         mainHandler.post {
@@ -270,10 +268,10 @@ class OverlayManager(private val context: Context) {
 
             isMorphing = true
             isFullscreen = expand
-            cancelActiveSprings()
+            card.animate().cancel()
+            scrim.animate().cancel()
             cornerAnimator?.cancel()
 
-            // Expanding to fullscreen means the user actively chose to watch -> keep open until Back!
             if (expand && !isKeepAlive) {
                 isKeepAlive = true
                 scheduleAutoDismiss(KEEP_ALIVE_SAFETY_CAP_MS)
@@ -286,7 +284,7 @@ class OverlayManager(private val context: Context) {
             val sy = cfg.overlayHeightPx.toFloat() / screenH.toFloat()
 
             if (expand) {
-                // 1. Expand host window ONCE to full-screen, with card pre-transformed onto exact PiP rect
+                // 1. Resize WindowManager host ONCE to full-screen
                 params.width = screenW
                 params.height = screenH
                 params.x = 0
@@ -296,46 +294,52 @@ class OverlayManager(private val context: Context) {
 
                 scrim.visibility = View.VISIBLE
                 scrim.alpha = 0f
-
                 card.layoutParams = FrameLayout.LayoutParams(screenW, screenH, Gravity.TOP or Gravity.START)
-                card.pivotX = 0f
-                card.pivotY = 0f
-                card.scaleX = sx
-                card.scaleY = sy
-                card.translationX = pipScreenX.toFloat()
-                card.translationY = pipScreenY.toFloat()
                 card.elevation = 0f
                 cardBg?.setStroke(0, Color.TRANSPARENT)
 
-                runCatching { wm.updateViewLayout(host, params) }
-
-                // 2. Smooth 60 fps GPU transform-matrix zoom into fullscreen
-                scrim.animate()
-                    .alpha(0.96f)
-                    .setDuration(320L)
-                    .setInterpolator(morphEase)
-                    .start()
-
-                animateCornerRadius(card, PIP_CORNER_RADIUS_PX, 0f, 340L)
-
-                card.animate()
-                    .scaleX(1f)
-                    .scaleY(1f)
-                    .translationX(0f)
-                    .translationY(0f)
-                    .setDuration(360L)
-                    .setInterpolator(morphEase)
-                    .withEndAction {
+                // 2. Intercept the EXACT first pre-draw AFTER card measures at screenW x screenH
+                runOnceOnPreDraw(card) {
+                    if (hostWindow !== host || isHiding) {
                         isMorphing = false
-                        if (hostWindow === host) {
-                            host.isFocusable = true
-                            host.isFocusableInTouchMode = true
-                            host.requestFocus()
-                        }
+                        return@runOnceOnPreDraw
                     }
-                    .start()
+                    card.pivotX = 0f
+                    card.pivotY = 0f
+                    card.scaleX = sx
+                    card.scaleY = sy
+                    card.translationX = pipScreenX.toFloat()
+                    card.translationY = pipScreenY.toFloat()
+
+                    scrim.animate()
+                        .alpha(0.95f)
+                        .setDuration(300L)
+                        .setInterpolator(morphEase)
+                        .start()
+
+                    animateCornerRadius(card, PIP_CORNER_RADIUS_PX, 0f, 320L)
+
+                    card.animate()
+                        .scaleX(1f)
+                        .scaleY(1f)
+                        .translationX(0f)
+                        .translationY(0f)
+                        .setDuration(340L)
+                        .setInterpolator(morphEase)
+                        .withEndAction {
+                            isMorphing = false
+                            if (hostWindow === host) {
+                                host.isFocusable = true
+                                host.isFocusableInTouchMode = true
+                                host.requestFocus()
+                            }
+                        }
+                        .start()
+                }
+
+                runCatching { wm.updateViewLayout(host, params) }
             } else {
-                // 1. Smooth 60 fps GPU transform-matrix glide back to the exact PiP corner
+                // 1. Glide card smoothly back onto the exact PiP corner rectangle at 60 fps
                 host.clearFocus()
                 host.isFocusable = false
                 host.isFocusableInTouchMode = false
@@ -359,9 +363,11 @@ class OverlayManager(private val context: Context) {
                     .setDuration(300L)
                     .setInterpolator(morphEase)
                     .withEndAction {
-                        isMorphing = false
-                        if (hostWindow !== host) return@withEndAction
-                        // 2. Shrink WindowManager host back to non-focusable corner PiP ONCE
+                        if (hostWindow !== host) {
+                            isMorphing = false
+                            return@withEndAction
+                        }
+                        // 2. Resize WindowManager back to corner PiP and reset transforms in OnPreDraw (zero jump!)
                         val pad = dp(HOST_PADDING_DP)
                         val (winX, winY) = pipWindowOrigin(cfg, screenW, screenH, pad)
                         params.width = cfg.overlayWidthPx + pad * 2
@@ -373,17 +379,22 @@ class OverlayManager(private val context: Context) {
 
                         scrim.visibility = View.GONE
                         card.layoutParams = FrameLayout.LayoutParams(cfg.overlayWidthPx, cfg.overlayHeightPx, Gravity.CENTER)
-                        card.pivotX = cfg.overlayWidthPx / 2f
-                        card.pivotY = cfg.overlayHeightPx / 2f
-                        card.scaleX = 1f
-                        card.scaleY = 1f
-                        card.translationX = 0f
-                        card.translationY = 0f
-                        card.elevation = dp(18).toFloat()
-                        cardBg?.setStroke(dp(1), Color.parseColor("#33FFFFFF"))
-                        currentCornerRadiusPx = PIP_CORNER_RADIUS_PX
-                        cardBg?.cornerRadius = currentCornerRadiusPx
-                        card.invalidateOutline()
+
+                        runOnceOnPreDraw(card) {
+                            card.pivotX = card.width / 2f
+                            card.pivotY = card.height / 2f
+                            card.scaleX = 1f
+                            card.scaleY = 1f
+                            card.translationX = 0f
+                            card.translationY = 0f
+                            card.elevation = dp(16).toFloat()
+                            cardBg?.setStroke(dp(1), Color.parseColor("#33FFFFFF"))
+                            currentCornerRadiusPx = PIP_CORNER_RADIUS_PX
+                            cardBg?.cornerRadius = currentCornerRadiusPx
+                            card.invalidateOutline()
+                            isMorphing = false
+                        }
+
                         runCatching { wm.updateViewLayout(host, params) }
                     }
                     .start()
@@ -396,7 +407,6 @@ class OverlayManager(private val context: Context) {
             val host = hostWindow
             val card = cardView
             val scrim = scrimView
-            val cfg = currentCfg
             if (host == null || card == null || isHiding) {
                 hideImmediate()
                 onDismissCallback?.invoke()
@@ -405,20 +415,20 @@ class OverlayManager(private val context: Context) {
             isHiding = true
             dismissRunnable?.let { mainHandler.removeCallbacks(it) }
             dismissRunnable = null
-            cancelActiveSprings()
+            card.animate().cancel()
+            scrim?.animate()?.cancel()
             cornerAnimator?.cancel()
 
-            scrim?.animate()?.alpha(0f)?.setDuration(200L)?.start()
+            scrim?.animate()?.alpha(0f)?.setDuration(180L)?.start()
 
-            val slideX = if (isFullscreen) 0f else edgeSlideDeltaX(cfg) * 0.7f
             card.pivotX = card.width / 2f
             card.pivotY = card.height / 2f
             card.animate()
                 .alpha(0f)
-                .scaleX(if (isFullscreen) 0.96f else 0.88f)
-                .scaleY(if (isFullscreen) 0.96f else 0.88f)
-                .translationX(slideX)
-                .setDuration(240L)
+                .scaleX(if (isFullscreen) 0.98f else 0.95f)
+                .scaleY(if (isFullscreen) 0.98f else 0.95f)
+                .translationY(if (isFullscreen) 0f else dp(12).toFloat())
+                .setDuration(200L)
                 .setInterpolator(exitEase)
                 .withEndAction {
                     val cb = onDismissCallback
@@ -432,7 +442,6 @@ class OverlayManager(private val context: Context) {
     fun hideImmediate() {
         dismissRunnable?.let { mainHandler.removeCallbacks(it) }
         dismissRunnable = null
-        cancelActiveSprings()
         cornerAnimator?.cancel()
         cornerAnimator = null
         dotAnimator?.cancel()
@@ -464,57 +473,56 @@ class OverlayManager(private val context: Context) {
         }
     }
 
-    private fun animateSpringEntrance(card: FrameLayout, scrim: View, cfg: PocConfig, fullscreen: Boolean) {
-        cancelActiveSprings()
+    private fun animateEntrance(card: FrameLayout, scrim: View, fullscreen: Boolean) {
         if (fullscreen) {
             scrim.visibility = View.VISIBLE
             scrim.alpha = 0f
-            scrim.animate().alpha(0.96f).setDuration(280L).setInterpolator(morphEase).start()
+            scrim.animate().alpha(0.95f).setDuration(260L).setInterpolator(appleEaseOut).start()
 
-            card.scaleX = 0.94f
-            card.scaleY = 0.94f
+            card.pivotX = card.width / 2f
+            card.pivotY = card.height / 2f
+            card.scaleX = 0.96f
+            card.scaleY = 0.96f
             card.alpha = 0f
             card.animate()
                 .alpha(1f)
                 .scaleX(1f)
                 .scaleY(1f)
-                .setDuration(320L)
-                .setInterpolator(morphEase)
+                .setDuration(280L)
+                .setInterpolator(appleEaseOut)
                 .start()
             return
         }
 
-        // True physics SpringAnimation inside padded transparent canvas (zero edge clipping!)
-        val startSlideX = edgeSlideDeltaX(cfg)
-        card.pivotX = cfg.overlayWidthPx / 2f
-        card.pivotY = cfg.overlayHeightPx / 2f
-        card.translationX = startSlideX
-        card.scaleX = 0.88f
-        card.scaleY = 0.88f
+        // Apple TV HomeKit style: gentle 20 dp upward rise + subtle scale + crisp fade (zero bounce/clip!)
+        card.pivotX = card.width / 2f
+        card.pivotY = card.height / 2f
+        card.translationX = 0f
+        card.translationY = dp(20).toFloat()
+        card.scaleX = 0.95f
+        card.scaleY = 0.95f
         card.alpha = 0f
 
         card.animate()
             .alpha(1f)
-            .setDuration(220L)
-            .setInterpolator(morphEase)
+            .translationY(0f)
+            .scaleX(1f)
+            .scaleY(1f)
+            .setDuration(300L)
+            .setInterpolator(appleEaseOut)
             .start()
+    }
 
-        val stiffness = 310f
-        val damping = 0.82f
-
-        val springX = SpringAnimation(card, DynamicAnimation.TRANSLATION_X, 0f).apply {
-            spring = SpringForce(0f).setStiffness(stiffness).setDampingRatio(damping)
-        }
-        val springSX = SpringAnimation(card, DynamicAnimation.SCALE_X, 1f).apply {
-            spring = SpringForce(1f).setStiffness(stiffness).setDampingRatio(damping)
-        }
-        val springSY = SpringAnimation(card, DynamicAnimation.SCALE_Y, 1f).apply {
-            spring = SpringForce(1f).setStiffness(stiffness).setDampingRatio(damping)
-        }
-        activeSprings.addAll(listOf(springX, springSX, springSY))
-        springX.start()
-        springSX.start()
-        springSY.start()
+    private fun runOnceOnPreDraw(view: View, action: () -> Unit) {
+        val vto = view.viewTreeObserver
+        vto.addOnPreDrawListener(object : ViewTreeObserver.OnPreDrawListener {
+            override fun onPreDraw(): Boolean {
+                val currentVto = view.viewTreeObserver
+                if (currentVto.isAlive) currentVto.removeOnPreDrawListener(this)
+                action()
+                return true
+            }
+        })
     }
 
     private fun animateCornerRadius(card: FrameLayout, from: Float, to: Float, durationMs: Long) {
@@ -529,11 +537,6 @@ class OverlayManager(private val context: Context) {
             }
             start()
         }
-    }
-
-    private fun cancelActiveSprings() {
-        activeSprings.forEach { runCatching { it.cancel() } }
-        activeSprings.clear()
     }
 
     private fun buildSubtleLiveDot(): View {
@@ -562,7 +565,6 @@ class OverlayManager(private val context: Context) {
         mainHandler.postDelayed(r, delayMs)
     }
 
-    /** Exact screen (x, y) of the visible PiP card's top-left corner. */
     private fun pipCardScreenPosition(cfg: PocConfig, screenW: Int, screenH: Int): Pair<Int, Int> {
         val m = dp(PIP_MARGIN_DP)
         return when (cfg.corner) {
@@ -573,15 +575,9 @@ class OverlayManager(private val context: Context) {
         }
     }
 
-    /** WindowManager origin accounting for the centered transparent padding around the card. */
     private fun pipWindowOrigin(cfg: PocConfig, screenW: Int, screenH: Int, pad: Int): Pair<Int, Int> {
         val (cardX, cardY) = pipCardScreenPosition(cfg, screenW, screenH)
         return (cardX - pad) to (cardY - pad)
-    }
-
-    private fun edgeSlideDeltaX(cfg: PocConfig?): Float {
-        val isLeft = cfg?.corner == OverlayCorner.TOP_LEFT || cfg?.corner == OverlayCorner.BOTTOM_LEFT
-        return if (isLeft) -dp(56).toFloat() else dp(56).toFloat()
     }
 
     @Suppress("DEPRECATION")
@@ -603,7 +599,7 @@ class OverlayManager(private val context: Context) {
         private const val TAG = "OverlayManager"
         private const val PIP_CORNER_RADIUS_PX = 20f
         private const val PIP_MARGIN_DP = 24
-        private const val HOST_PADDING_DP = 64
+        private const val HOST_PADDING_DP = 32
         private const val KEEP_ALIVE_SAFETY_CAP_MS = 5 * 60 * 1000L
     }
 }
