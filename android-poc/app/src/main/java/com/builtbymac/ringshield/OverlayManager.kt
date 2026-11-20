@@ -17,29 +17,29 @@ import android.view.Gravity
 import android.view.KeyEvent
 import android.view.View
 import android.view.ViewOutlineProvider
-import android.view.ViewTreeObserver
 import android.view.WindowManager
 import android.view.animation.PathInterpolator
 import android.widget.FrameLayout
 import org.webrtc.EglBase
 
 /**
- * Apple TV HomeKit-style pure-video overlay for Nvidia Shield Pro.
+ * Apple TV-grade, zero-glitch 60 fps pure-video overlay for Nvidia Shield Pro.
  *
- * Zero-glitch animation architecture:
- *  - Entrance / Exit: Synchronized single ViewPropertyAnimator (gentle 20 dp vertical lift +
- *    subtle 0.96->1.0 scale + alpha) with Apple ease-out curve (0.16, 1, 0.3, 1), running inside
- *    a padded transparent WindowManager host so nothing ever clips.
- *  - PiP <-> Fullscreen: Waits for OnPreDrawListener AFTER WindowManager finishes resizing
- *    before setting the exact initial GPU transform matrix (scaleX/scaleY/translationX/translationY)
- *    — guaranteeing pixel-exact frame 1 with zero jump, zero postage-stamp shrink, and locked 60 fps!
- *  - Continuous viewing: On-demand or expanded fullscreen cancels auto-dismiss until Back/Dismiss.
+ * Why this never jumps, clips, or stutters:
+ *  - The transparent WindowManager host is created ONCE at exact full-screen dimensions
+ *    (MATCH_PARENT x MATCH_PARENT) and NEVER resized.
+ *  - In PiP mode, FLAG_NOT_FOCUSABLE | FLAG_NOT_TOUCHABLE makes the transparent area 100%
+ *    pass-through to YouTube/Netflix/Dolby Vision apps.
+ *  - The video card itself stays laid out at full display size (1920x1080) and is positioned
+ *    into the corner PiP rect via pure GPU transform matrices (pivot 0,0 + scaleX/Y + transX/Y).
+ *  - Entrance, PiP -> Fullscreen, Fullscreen -> PiP, and Exit are therefore pure 60 fps OpenGL
+ *    transform animations with ZERO WindowManager layout resizes and ZERO EGL surface reallocations!
  */
 class OverlayManager(private val context: Context) {
 
     private val wm = context.getSystemService(Context.WINDOW_SERVICE) as WindowManager
     private val mainHandler = Handler(Looper.getMainLooper())
-    private val appleEaseOut = PathInterpolator(0.16f, 1f, 0.3f, 1f)
+    private val enterEase = PathInterpolator(0.16f, 1f, 0.3f, 1f)
     private val morphEase = PathInterpolator(0.22f, 1f, 0.36f, 1f)
     private val exitEase = PathInterpolator(0.4f, 0f, 1f, 1f)
 
@@ -49,8 +49,9 @@ class OverlayManager(private val context: Context) {
     private var rootParams: WindowManager.LayoutParams? = null
     private var renderer: TextureViewRenderer? = null
     private var currentCfg: PocConfig? = null
-    private var currentCornerRadiusPx: Float = PIP_CORNER_RADIUS_PX
-    private var cardBg: GradientDrawable? = null
+    private var screenW: Int = 1920
+    private var screenH: Int = 1080
+    private var currentCornerRadiusPx: Float = 0f
 
     private var dotAnimator: ObjectAnimator? = null
     private var cornerAnimator: ValueAnimator? = null
@@ -71,7 +72,6 @@ class OverlayManager(private val context: Context) {
         private set
 
     private var isHiding: Boolean = false
-    private var isMorphing: Boolean = false
 
     fun canDrawOverlays(): Boolean = runCatching { Settings.canDrawOverlays(context) }.getOrDefault(false)
 
@@ -91,6 +91,9 @@ class OverlayManager(private val context: Context) {
 
         hideImmediate()
 
+        val (sw, sh) = getScreenSize()
+        screenW = sw
+        screenH = sh
         currentCfg = cfg
         onDismissCallback = onAutoDismiss
         onKeepAliveCallback = onKeepAliveActivated
@@ -98,35 +101,21 @@ class OverlayManager(private val context: Context) {
         isKeepAlive = keepAliveUntilDismissed || startFullscreen
         isShowing = true
         isHiding = false
-        isMorphing = false
 
-        val (screenW, screenH) = getScreenSize()
-        val pad = if (startFullscreen) 0 else dp(HOST_PADDING_DP)
-        val winW = if (startFullscreen) screenW else cfg.overlayWidthPx + pad * 2
-        val winH = if (startFullscreen) screenH else cfg.overlayHeightPx + pad * 2
-        currentCornerRadiusPx = if (startFullscreen) 0f else PIP_CORNER_RADIUS_PX
-
-        val bg = GradientDrawable().apply {
-            shape = GradientDrawable.RECTANGLE
-            cornerRadius = currentCornerRadiusPx
-            setColor(Color.BLACK)
-            setStroke(if (startFullscreen) 0 else dp(1), Color.parseColor("#33FFFFFF"))
-        }
-        cardBg = bg
+        val pip = computePipTransform(cfg)
+        currentCornerRadiusPx = if (startFullscreen) 0f else pip.unscaledCornerRadius
 
         val host = object : FrameLayout(context) {
             override fun dispatchKeyEvent(event: KeyEvent): Boolean {
-                if ((isFullscreen || isKeepAlive) && event.action == KeyEvent.ACTION_DOWN) {
+                if (isFullscreen && event.action == KeyEvent.ACTION_DOWN) {
                     when (event.keyCode) {
                         KeyEvent.KEYCODE_BACK, KeyEvent.KEYCODE_ESCAPE -> {
                             dismissAnimated()
                             return true
                         }
                         KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER -> {
-                            if (isFullscreen) {
-                                setFullscreen(false)
-                                return true
-                            }
+                            setFullscreen(false)
+                            return true
                         }
                     }
                 }
@@ -141,7 +130,6 @@ class OverlayManager(private val context: Context) {
         val scrim = View(context).apply {
             setBackgroundColor(Color.BLACK)
             alpha = 0f
-            visibility = if (startFullscreen) View.VISIBLE else View.GONE
         }
         scrimView = scrim
         host.addView(
@@ -153,16 +141,17 @@ class OverlayManager(private val context: Context) {
         )
 
         val card = FrameLayout(context).apply {
+            setBackgroundColor(Color.BLACK)
             alpha = 0f
-            elevation = if (startFullscreen) 0f else dp(16).toFloat()
-            background = bg
+            pivotX = 0f
+            pivotY = 0f
+            elevation = if (startFullscreen) 0f else dp(18).toFloat()
             outlineProvider = object : ViewOutlineProvider() {
                 override fun getOutline(view: View, outline: Outline) {
                     outline.setRoundRect(0, 0, view.width, view.height, currentCornerRadiusPx)
                 }
             }
             clipToOutline = true
-            setOnClickListener { toggleFullscreen() }
         }
 
         val videoView = TextureViewRenderer(context).apply {
@@ -171,7 +160,7 @@ class OverlayManager(private val context: Context) {
                 onFirstFrame = {
                     mainHandler.post {
                         if (hostWindow === host && !isHiding) {
-                            animateEntrance(card, scrim, startFullscreen)
+                            animateEntrance(card, scrim, pip, startFullscreen)
                             onFirstFrameVisible()
                         }
                     }
@@ -189,38 +178,34 @@ class OverlayManager(private val context: Context) {
         )
 
         if (cfg.showLiveDot) {
-            card.addView(buildSubtleLiveDot())
+            card.addView(buildSubtleLiveDot(pip.scaleX))
         }
 
-        val cardLp = if (startFullscreen) {
-            FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.MATCH_PARENT,
-                FrameLayout.LayoutParams.MATCH_PARENT,
-            )
+        // Pre-position card at exact target rect BEFORE adding window (stays alpha=0 until first frame)
+        if (startFullscreen) {
+            card.scaleX = 1f
+            card.scaleY = 1f
+            card.translationX = 0f
+            card.translationY = 0f
         } else {
-            FrameLayout.LayoutParams(cfg.overlayWidthPx, cfg.overlayHeightPx, Gravity.CENTER)
+            card.scaleX = pip.scaleX
+            card.scaleY = pip.scaleY
+            card.translationX = pip.x
+            card.translationY = pip.y
         }
-        host.addView(card, cardLp)
 
-        val (initX, initY) = if (startFullscreen) 0 to 0 else pipWindowOrigin(cfg, screenW, screenH, pad)
-        val flags = if (startFullscreen) {
-            WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
-        } else {
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
-        }
+        host.addView(card, FrameLayout.LayoutParams(screenW, screenH, Gravity.TOP or Gravity.START))
 
         val params = WindowManager.LayoutParams(
-            winW,
-            winH,
+            screenW,
+            screenH,
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-            flags,
+            flagsFor(fullscreen = startFullscreen),
             PixelFormat.TRANSLUCENT,
         ).apply {
             gravity = Gravity.TOP or Gravity.START
-            x = initX
-            y = initY
+            x = 0
+            y = 0
             title = "ring-shield-overlay"
         }
 
@@ -236,26 +221,20 @@ class OverlayManager(private val context: Context) {
             host.requestFocus()
         }
 
-        if (!isKeepAlive) {
-            scheduleAutoDismiss(cfg.overlayDurationSec * 1000L)
-        } else {
-            scheduleAutoDismiss(KEEP_ALIVE_SAFETY_CAP_MS)
-        }
-
+        scheduleAutoDismiss(if (isKeepAlive) KEEP_ALIVE_SAFETY_CAP_MS else cfg.overlayDurationSec * 1000L)
         return videoView
     }
 
     fun toggleFullscreen() {
         mainHandler.post {
-            if (!isShowing || isHiding || isMorphing) return@post
+            if (!isShowing || isHiding) return@post
             setFullscreen(!isFullscreen)
         }
     }
 
     /**
-     * Pixel-exact 60 fps GPU PiP <-> Fullscreen morph.
-     * Uses OnPreDrawListener so WindowManager layout finishes BEFORE frame 1 draws —
-     * eliminating any postage-stamp shrink or coordinate jump!
+     * Pure 60 fps GPU transform-matrix PiP <-> Fullscreen morph.
+     * Window size NEVER changes — only focus/touch pass-through flags toggle cleanly!
      */
     fun setFullscreen(expand: Boolean) {
         mainHandler.post {
@@ -264,9 +243,8 @@ class OverlayManager(private val context: Context) {
             val scrim = scrimView ?: return@post
             val params = rootParams ?: return@post
             val cfg = currentCfg ?: return@post
-            if (!isShowing || isHiding || isMorphing || isFullscreen == expand) return@post
+            if (!isShowing || isHiding || isFullscreen == expand) return@post
 
-            isMorphing = true
             isFullscreen = expand
             card.animate().cancel()
             scrim.animate().cancel()
@@ -278,125 +256,58 @@ class OverlayManager(private val context: Context) {
                 onKeepAliveCallback?.invoke()
             }
 
-            val (screenW, screenH) = getScreenSize()
-            val (pipScreenX, pipScreenY) = pipCardScreenPosition(cfg, screenW, screenH)
-            val sx = cfg.overlayWidthPx.toFloat() / screenW.toFloat()
-            val sy = cfg.overlayHeightPx.toFloat() / screenH.toFloat()
-
+            // Update only focus/touch flags (window geometry stays locked at 1920x1080 -> zero glitch!)
+            params.flags = flagsFor(fullscreen = expand)
+            runCatching { wm.updateViewLayout(host, params) }
             if (expand) {
-                // 1. Resize WindowManager host ONCE to full-screen
-                params.width = screenW
-                params.height = screenH
-                params.x = 0
-                params.y = 0
-                params.flags = WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-                    WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
-
-                scrim.visibility = View.VISIBLE
-                scrim.alpha = 0f
-                card.layoutParams = FrameLayout.LayoutParams(screenW, screenH, Gravity.TOP or Gravity.START)
-                card.elevation = 0f
-                cardBg?.setStroke(0, Color.TRANSPARENT)
-
-                // 2. Intercept the EXACT first pre-draw AFTER card measures at screenW x screenH
-                runOnceOnPreDraw(card) {
-                    if (hostWindow !== host || isHiding) {
-                        isMorphing = false
-                        return@runOnceOnPreDraw
-                    }
-                    card.pivotX = 0f
-                    card.pivotY = 0f
-                    card.scaleX = sx
-                    card.scaleY = sy
-                    card.translationX = pipScreenX.toFloat()
-                    card.translationY = pipScreenY.toFloat()
-
-                    scrim.animate()
-                        .alpha(0.95f)
-                        .setDuration(300L)
-                        .setInterpolator(morphEase)
-                        .start()
-
-                    animateCornerRadius(card, PIP_CORNER_RADIUS_PX, 0f, 320L)
-
-                    card.animate()
-                        .scaleX(1f)
-                        .scaleY(1f)
-                        .translationX(0f)
-                        .translationY(0f)
-                        .setDuration(340L)
-                        .setInterpolator(morphEase)
-                        .withEndAction {
-                            isMorphing = false
-                            if (hostWindow === host) {
-                                host.isFocusable = true
-                                host.isFocusableInTouchMode = true
-                                host.requestFocus()
-                            }
-                        }
-                        .start()
-                }
-
-                runCatching { wm.updateViewLayout(host, params) }
+                host.isFocusable = true
+                host.isFocusableInTouchMode = true
+                host.requestFocus()
             } else {
-                // 1. Glide card smoothly back onto the exact PiP corner rectangle at 60 fps
                 host.clearFocus()
                 host.isFocusable = false
                 host.isFocusableInTouchMode = false
+            }
 
-                card.pivotX = 0f
-                card.pivotY = 0f
+            val pip = computePipTransform(cfg)
+            card.pivotX = 0f
+            card.pivotY = 0f
 
+            if (expand) {
+                card.elevation = 0f
                 scrim.animate()
-                    .alpha(0f)
-                    .setDuration(240L)
+                    .alpha(0.95f)
+                    .setDuration(320L)
                     .setInterpolator(morphEase)
                     .start()
 
-                animateCornerRadius(card, 0f, PIP_CORNER_RADIUS_PX, 280L)
+                animateCornerRadius(card, currentCornerRadiusPx, 0f, 340L)
 
                 card.animate()
-                    .scaleX(sx)
-                    .scaleY(sy)
-                    .translationX(pipScreenX.toFloat())
-                    .translationY(pipScreenY.toFloat())
-                    .setDuration(300L)
+                    .scaleX(1f)
+                    .scaleY(1f)
+                    .translationX(0f)
+                    .translationY(0f)
+                    .setDuration(360L)
                     .setInterpolator(morphEase)
-                    .withEndAction {
-                        if (hostWindow !== host) {
-                            isMorphing = false
-                            return@withEndAction
-                        }
-                        // 2. Resize WindowManager back to corner PiP and reset transforms in OnPreDraw (zero jump!)
-                        val pad = dp(HOST_PADDING_DP)
-                        val (winX, winY) = pipWindowOrigin(cfg, screenW, screenH, pad)
-                        params.width = cfg.overlayWidthPx + pad * 2
-                        params.height = cfg.overlayHeightPx + pad * 2
-                        params.x = winX
-                        params.y = winY
-                        params.flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                            WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
+                    .start()
+            } else {
+                card.elevation = dp(18).toFloat()
+                scrim.animate()
+                    .alpha(0f)
+                    .setDuration(260L)
+                    .setInterpolator(morphEase)
+                    .start()
 
-                        scrim.visibility = View.GONE
-                        card.layoutParams = FrameLayout.LayoutParams(cfg.overlayWidthPx, cfg.overlayHeightPx, Gravity.CENTER)
+                animateCornerRadius(card, currentCornerRadiusPx, pip.unscaledCornerRadius, 300L)
 
-                        runOnceOnPreDraw(card) {
-                            card.pivotX = card.width / 2f
-                            card.pivotY = card.height / 2f
-                            card.scaleX = 1f
-                            card.scaleY = 1f
-                            card.translationX = 0f
-                            card.translationY = 0f
-                            card.elevation = dp(16).toFloat()
-                            cardBg?.setStroke(dp(1), Color.parseColor("#33FFFFFF"))
-                            currentCornerRadiusPx = PIP_CORNER_RADIUS_PX
-                            cardBg?.cornerRadius = currentCornerRadiusPx
-                            card.invalidateOutline()
-                            isMorphing = false
-                        }
-
-                        runCatching { wm.updateViewLayout(host, params) }
-                    }
+                card.animate()
+                    .scaleX(pip.scaleX)
+                    .scaleY(pip.scaleY)
+                    .translationX(pip.x)
+                    .translationY(pip.y)
+                    .setDuration(320L)
+                    .setInterpolator(morphEase)
                     .start()
             }
         }
@@ -407,7 +318,8 @@ class OverlayManager(private val context: Context) {
             val host = hostWindow
             val card = cardView
             val scrim = scrimView
-            if (host == null || card == null || isHiding) {
+            val cfg = currentCfg
+            if (host == null || card == null || cfg == null || isHiding) {
                 hideImmediate()
                 onDismissCallback?.invoke()
                 return@post
@@ -419,23 +331,42 @@ class OverlayManager(private val context: Context) {
             scrim?.animate()?.cancel()
             cornerAnimator?.cancel()
 
-            scrim?.animate()?.alpha(0f)?.setDuration(180L)?.start()
+            scrim?.animate()?.alpha(0f)?.setDuration(220L)?.setInterpolator(exitEase)?.start()
 
-            card.pivotX = card.width / 2f
-            card.pivotY = card.height / 2f
-            card.animate()
-                .alpha(0f)
-                .scaleX(if (isFullscreen) 0.98f else 0.95f)
-                .scaleY(if (isFullscreen) 0.98f else 0.95f)
-                .translationY(if (isFullscreen) 0f else dp(12).toFloat())
-                .setDuration(200L)
-                .setInterpolator(exitEase)
-                .withEndAction {
-                    val cb = onDismissCallback
-                    hideImmediate()
-                    cb?.invoke()
-                }
-                .start()
+            if (isFullscreen) {
+                card.pivotX = screenW / 2f
+                card.pivotY = screenH / 2f
+                card.animate()
+                    .alpha(0f)
+                    .scaleX(0.96f)
+                    .scaleY(0.96f)
+                    .setDuration(220L)
+                    .setInterpolator(exitEase)
+                    .withEndAction {
+                        val cb = onDismissCallback
+                        hideImmediate()
+                        cb?.invoke()
+                    }
+                    .start()
+            } else {
+                val pip = computePipTransform(cfg)
+                val slideOutX = pip.x + edgeSlideDeltaPx(cfg) * 0.85f
+                card.pivotX = 0f
+                card.pivotY = 0f
+                card.animate()
+                    .alpha(0f)
+                    .translationX(slideOutX)
+                    .scaleX(pip.scaleX * 0.94f)
+                    .scaleY(pip.scaleY * 0.94f)
+                    .setDuration(240L)
+                    .setInterpolator(exitEase)
+                    .withEndAction {
+                        val cb = onDismissCallback
+                        hideImmediate()
+                        cb?.invoke()
+                    }
+                    .start()
+            }
         }
     }
 
@@ -458,13 +389,11 @@ class OverlayManager(private val context: Context) {
         scrimView = null
         cardView = null
         rootParams = null
-        cardBg = null
         currentCfg = null
         isShowing = false
         isFullscreen = false
         isKeepAlive = false
         isHiding = false
-        isMorphing = false
 
         if (h != null) {
             runCatching { h.animate().cancel() }
@@ -473,56 +402,52 @@ class OverlayManager(private val context: Context) {
         }
     }
 
-    private fun animateEntrance(card: FrameLayout, scrim: View, fullscreen: Boolean) {
+    private fun animateEntrance(card: FrameLayout, scrim: View, pip: PipTransform, fullscreen: Boolean) {
+        val cfg = currentCfg ?: return
         if (fullscreen) {
-            scrim.visibility = View.VISIBLE
             scrim.alpha = 0f
-            scrim.animate().alpha(0.95f).setDuration(260L).setInterpolator(appleEaseOut).start()
+            scrim.animate().alpha(0.95f).setDuration(280L).setInterpolator(enterEase).start()
 
-            card.pivotX = card.width / 2f
-            card.pivotY = card.height / 2f
-            card.scaleX = 0.96f
-            card.scaleY = 0.96f
+            card.pivotX = screenW / 2f
+            card.pivotY = screenH / 2f
+            card.translationX = 0f
+            card.translationY = 0f
+            card.scaleX = 0.95f
+            card.scaleY = 0.95f
             card.alpha = 0f
             card.animate()
                 .alpha(1f)
                 .scaleX(1f)
                 .scaleY(1f)
-                .setDuration(280L)
-                .setInterpolator(appleEaseOut)
+                .setDuration(300L)
+                .setInterpolator(enterEase)
                 .start()
             return
         }
 
-        // Apple TV HomeKit style: gentle 20 dp upward rise + subtle scale + crisp fade (zero bounce/clip!)
-        card.pivotX = card.width / 2f
-        card.pivotY = card.height / 2f
-        card.translationX = 0f
-        card.translationY = dp(20).toFloat()
-        card.scaleX = 0.95f
-        card.scaleY = 0.95f
+        // Silky Apple TV slide-and-settle from corner edge on the unclipped full-screen GPU canvas
+        val startScaleX = pip.scaleX * 0.92f
+        val startScaleY = pip.scaleY * 0.92f
+        val startX = pip.x + edgeSlideDeltaPx(cfg)
+        val startY = pip.y + (cfg.overlayHeightPx * 0.04f)
+
+        card.pivotX = 0f
+        card.pivotY = 0f
+        card.translationX = startX
+        card.translationY = startY
+        card.scaleX = startScaleX
+        card.scaleY = startScaleY
         card.alpha = 0f
 
         card.animate()
             .alpha(1f)
-            .translationY(0f)
-            .scaleX(1f)
-            .scaleY(1f)
-            .setDuration(300L)
-            .setInterpolator(appleEaseOut)
+            .translationX(pip.x)
+            .translationY(pip.y)
+            .scaleX(pip.scaleX)
+            .scaleY(pip.scaleY)
+            .setDuration(360L)
+            .setInterpolator(enterEase)
             .start()
-    }
-
-    private fun runOnceOnPreDraw(view: View, action: () -> Unit) {
-        val vto = view.viewTreeObserver
-        vto.addOnPreDrawListener(object : ViewTreeObserver.OnPreDrawListener {
-            override fun onPreDraw(): Boolean {
-                val currentVto = view.viewTreeObserver
-                if (currentVto.isAlive) currentVto.removeOnPreDrawListener(this)
-                action()
-                return true
-            }
-        })
     }
 
     private fun animateCornerRadius(card: FrameLayout, from: Float, to: Float, durationMs: Long) {
@@ -532,22 +457,24 @@ class OverlayManager(private val context: Context) {
             interpolator = morphEase
             addUpdateListener { anim ->
                 currentCornerRadiusPx = anim.animatedValue as Float
-                cardBg?.cornerRadius = currentCornerRadiusPx
                 card.invalidateOutline()
             }
             start()
         }
     }
 
-    private fun buildSubtleLiveDot(): View {
-        val size = dp(7)
+    private fun buildSubtleLiveDot(pipScale: Float): View {
+        // Scale up inversely so the dot looks crisp (~7 dp) when scaled down into corner PiP
+        val inv = (1f / pipScale.coerceAtLeast(0.2f))
+        val size = (dp(7) * inv).toInt()
+        val margin = (dp(12) * inv).toInt()
         val dot = View(context).apply {
             background = GradientDrawable().apply {
                 shape = GradientDrawable.OVAL
                 setColor(Color.parseColor("#FFFF3B30"))
             }
             layoutParams = FrameLayout.LayoutParams(size, size, Gravity.TOP or Gravity.START).apply {
-                setMargins(dp(12), dp(12), 0, 0)
+                setMargins(margin, margin, 0, 0)
             }
         }
         dotAnimator = ObjectAnimator.ofFloat(dot, View.ALPHA, 1f, 0.25f, 1f).apply {
@@ -565,19 +492,49 @@ class OverlayManager(private val context: Context) {
         mainHandler.postDelayed(r, delayMs)
     }
 
-    private fun pipCardScreenPosition(cfg: PocConfig, screenW: Int, screenH: Int): Pair<Int, Int> {
-        val m = dp(PIP_MARGIN_DP)
-        return when (cfg.corner) {
-            OverlayCorner.TOP_RIGHT -> (screenW - cfg.overlayWidthPx - m) to m
-            OverlayCorner.TOP_LEFT -> m to m
-            OverlayCorner.BOTTOM_RIGHT -> (screenW - cfg.overlayWidthPx - m) to (screenH - cfg.overlayHeightPx - m)
-            OverlayCorner.BOTTOM_LEFT -> m to (screenH - cfg.overlayHeightPx - m)
+    private data class PipTransform(
+        val x: Float,
+        val y: Float,
+        val scaleX: Float,
+        val scaleY: Float,
+        val unscaledCornerRadius: Float,
+    )
+
+    private fun computePipTransform(cfg: PocConfig): PipTransform {
+        val m = dp(PIP_MARGIN_DP).toFloat()
+        val sx = cfg.overlayWidthPx.toFloat() / screenW.toFloat()
+        val sy = cfg.overlayHeightPx.toFloat() / screenH.toFloat()
+        val x = when (cfg.corner) {
+            OverlayCorner.TOP_RIGHT, OverlayCorner.BOTTOM_RIGHT -> screenW - cfg.overlayWidthPx - m
+            OverlayCorner.TOP_LEFT, OverlayCorner.BOTTOM_LEFT -> m
         }
+        val y = when (cfg.corner) {
+            OverlayCorner.TOP_RIGHT, OverlayCorner.TOP_LEFT -> m
+            OverlayCorner.BOTTOM_RIGHT, OverlayCorner.BOTTOM_LEFT -> screenH - cfg.overlayHeightPx - m
+        }
+        return PipTransform(
+            x = x,
+            y = y,
+            scaleX = sx,
+            scaleY = sy,
+            unscaledCornerRadius = PIP_VISUAL_CORNER_RADIUS_PX / sx.coerceAtLeast(0.1f),
+        )
     }
 
-    private fun pipWindowOrigin(cfg: PocConfig, screenW: Int, screenH: Int, pad: Int): Pair<Int, Int> {
-        val (cardX, cardY) = pipCardScreenPosition(cfg, screenW, screenH)
-        return (cardX - pad) to (cardY - pad)
+    private fun edgeSlideDeltaPx(cfg: PocConfig): Float {
+        val isLeft = cfg.corner == OverlayCorner.TOP_LEFT || cfg.corner == OverlayCorner.BOTTOM_LEFT
+        val delta = dp(48).toFloat()
+        return if (isLeft) -delta else delta
+    }
+
+    private fun flagsFor(fullscreen: Boolean): Int = if (fullscreen) {
+        WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+            WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
+    } else {
+        WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+            WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+            WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+            WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
     }
 
     @Suppress("DEPRECATION")
@@ -597,9 +554,8 @@ class OverlayManager(private val context: Context) {
 
     companion object {
         private const val TAG = "OverlayManager"
-        private const val PIP_CORNER_RADIUS_PX = 20f
+        private const val PIP_VISUAL_CORNER_RADIUS_PX = 20f
         private const val PIP_MARGIN_DP = 24
-        private const val HOST_PADDING_DP = 32
         private const val KEEP_ALIVE_SAFETY_CAP_MS = 5 * 60 * 1000L
     }
 }

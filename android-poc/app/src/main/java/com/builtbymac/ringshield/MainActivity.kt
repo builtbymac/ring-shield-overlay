@@ -178,9 +178,23 @@ class MainActivity : AppCompatActivity() {
         testPipBtn.requestFocus()
     }
 
+    private val uiHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private val statusTicker = object : Runnable {
+        override fun run() {
+            refreshUi()
+            uiHandler.postDelayed(this, 1000L)
+        }
+    }
+
     override fun onResume() {
         super.onResume()
-        refreshUi()
+        uiHandler.removeCallbacks(statusTicker)
+        statusTicker.run()
+    }
+
+    override fun onPause() {
+        uiHandler.removeCallbacks(statusTicker)
+        super.onPause()
     }
 
     private fun updateConfig(transform: (PocConfig) -> PocConfig) {
