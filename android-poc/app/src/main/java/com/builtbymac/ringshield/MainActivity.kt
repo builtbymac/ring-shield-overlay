@@ -27,9 +27,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var cornerBtn: Button
     private lateinit var sizeBtn: Button
     private lateinit var durationBtn: Button
-    private lateinit var cropBtn: Button
     private lateinit var dotBtn: Button
-    private lateinit var barBtn: Button
     private lateinit var smoothBtn: Button
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -132,14 +130,8 @@ class MainActivity : AppCompatActivity() {
                 it.copy(overlayDurationSec = next)
             }
         }
-        cropBtn = tvButton("") {
-            updateConfig { it.copy(cropRingWatermark = !it.cropRingWatermark) }
-        }
         dotBtn = tvButton("") {
             updateConfig { it.copy(showLiveDot = !it.showLiveDot) }
-        }
-        barBtn = tvButton("") {
-            updateConfig { it.copy(showCountdownBar = !it.showCountdownBar) }
         }
         smoothBtn = tvButton("") {
             updateConfig {
@@ -171,7 +163,7 @@ class MainActivity : AppCompatActivity() {
         root.addView(settingsHeader)
 
         val settingsGrid = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        listOf(cornerBtn, sizeBtn, durationBtn, cropBtn, dotBtn, barBtn, smoothBtn, permBtn).forEach { btn ->
+        listOf(cornerBtn, sizeBtn, durationBtn, dotBtn, smoothBtn, permBtn).forEach { btn ->
             settingsGrid.addView(
                 btn,
                 LinearLayout.LayoutParams(dp(440), LinearLayout.LayoutParams.WRAP_CONTENT).apply {
@@ -219,9 +211,7 @@ class MainActivity : AppCompatActivity() {
         cornerBtn.text = "Corner Position : ${cfg.corner.label}"
         sizeBtn.text = "PiP Overlay Size : ${cfg.overlayWidthPx}×${cfg.overlayHeightPx}"
         durationBtn.text = "Auto-Dismiss Duration : ${cfg.overlayDurationSec}s"
-        cropBtn.text = "Crop Ring Dev Watermark : ${if (cfg.cropRingWatermark) "ON (Clean Video)" else "OFF (Full Uncropped)"}"
-        dotBtn.text = "Pulsing Red Live Dot : ${if (cfg.showLiveDot) "ON" else "OFF"}"
-        barBtn.text = "Bottom Countdown Hairline : ${if (cfg.showCountdownBar) "ON" else "OFF"}"
+        dotBtn.text = "Subtle Red Live Dot : ${if (cfg.showLiveDot) "ON" else "OFF (Pure Video)"}"
         val smoothLabel = when (cfg.minPlayoutDelayMs) {
             0 -> "0 ms (Raw / Lowest Latency)"
             350 -> "350 ms (Smooth — Recommended)"

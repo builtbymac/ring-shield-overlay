@@ -32,9 +32,9 @@ data class PocConfig(
     val iceGatherBudgetMs: Long = 1500L,
     val prewarmTtlMs: Long = 25_000L,
     val minPlayoutDelayMs: Int = 350,
-    val cropRingWatermark: Boolean = true,
-    val showLiveDot: Boolean = true,
-    val showCountdownBar: Boolean = true,
+    val cropRingWatermark: Boolean = false,
+    val showLiveDot: Boolean = false,
+    val showCountdownBar: Boolean = false,
 )
 
 object ConfigStore {
@@ -73,9 +73,9 @@ object ConfigStore {
                 iceGatherBudgetMs = json.optLong("iceGatherBudgetMs", 1500L).coerceIn(50L, 5000L),
                 prewarmTtlMs = json.optLong("prewarmTtlMs", 25_000L).coerceIn(5_000L, 60_000L),
                 minPlayoutDelayMs = json.optInt("minPlayoutDelayMs", 350).coerceIn(0, 1500),
-                cropRingWatermark = json.optBoolean("cropRingWatermark", true),
-                showLiveDot = json.optBoolean("showLiveDot", true),
-                showCountdownBar = json.optBoolean("showCountdownBar", true),
+                cropRingWatermark = json.optBoolean("cropRingWatermark", false),
+                showLiveDot = json.optBoolean("showLiveDot", false),
+                showCountdownBar = json.optBoolean("showCountdownBar", false),
             )
         } catch (ex: Throwable) {
             Log.e(TAG, "Failed to parse ${file.absolutePath}: ${ex.message}")
