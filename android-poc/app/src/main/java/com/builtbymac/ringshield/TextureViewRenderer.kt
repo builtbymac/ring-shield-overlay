@@ -51,7 +51,7 @@ class TextureViewRenderer(context: Context) : TextureView(context),
 
         val drawer: RendererCommon.GlDrawer = if (inpaintWatermarks) {
             Log.i(TAG, "Using WatermarkInpaintDrawer (GPU Coons-patch watermark eraser ON)")
-            WatermarkInpaintDrawer()
+            org.webrtc.WatermarkInpaintDrawerFactory.create()
         } else {
             GlRectDrawer()
         }
