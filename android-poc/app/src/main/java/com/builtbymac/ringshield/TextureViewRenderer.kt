@@ -49,6 +49,7 @@ class TextureViewRenderer(context: Context) : TextureView(context),
         eglRenderer.init(eglContext, EglBase.CONFIG_PLAIN, GlRectDrawer())
         if (isAvailable && surfaceTexture != null) {
             eglRenderer.createEglSurface(surfaceTexture)
+            eglRenderer.clearImage(0f, 0f, 0f, 1f)
         }
     }
 
@@ -67,6 +68,7 @@ class TextureViewRenderer(context: Context) : TextureView(context),
     override fun onSurfaceTextureAvailable(surface: SurfaceTexture, width: Int, height: Int) {
         if (initialized) {
             eglRenderer.createEglSurface(surface)
+            eglRenderer.clearImage(0f, 0f, 0f, 1f)
             if (height > 0) {
                 eglRenderer.setLayoutAspectRatio(width.toFloat() / height.toFloat())
             }

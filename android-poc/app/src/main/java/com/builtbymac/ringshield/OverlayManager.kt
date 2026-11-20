@@ -39,9 +39,10 @@ class OverlayManager(private val context: Context) {
 
     private val wm = context.getSystemService(Context.WINDOW_SERVICE) as WindowManager
     private val mainHandler = Handler(Looper.getMainLooper())
-    private val enterEase = PathInterpolator(0.16f, 1f, 0.3f, 1f)
-    private val morphEase = PathInterpolator(0.22f, 1f, 0.36f, 1f)
-    private val exitEase = PathInterpolator(0.4f, 0f, 1f, 1f)
+    // Apple tvOS / iOS fluid spring-like transition curve
+    private val enterEase = PathInterpolator(0.25f, 0.9f, 0.25f, 1f)
+    private val morphEase = PathInterpolator(0.32f, 0.72f, 0f, 1f)
+    private val exitEase = PathInterpolator(0.4f, 0f, 0.2f, 1f)
 
     private var hostWindow: FrameLayout? = null
     private var scrimView: View? = null
@@ -145,7 +146,8 @@ class OverlayManager(private val context: Context) {
             alpha = 0f
             pivotX = 0f
             pivotY = 0f
-            elevation = if (startFullscreen) 0f else dp(18).toFloat()
+            // Keep elevation 0 while hidden so Android HWUI never renders a shadow before frame 1
+            elevation = 0f
             outlineProvider = object : ViewOutlineProvider() {
                 override fun getOutline(view: View, outline: Outline) {
                     outline.setRoundRect(0, 0, view.width, view.height, currentCornerRadiusPx)
@@ -155,12 +157,15 @@ class OverlayManager(private val context: Context) {
         }
 
         val videoView = TextureViewRenderer(context).apply {
+            // Crucial on Android HWUI: TextureView hardware layers must have their own alpha=0f
+            // while waiting for frame 1, otherwise SurfaceFlinger composites recycled Gralloc VRAM!
+            alpha = 0f
             init(
                 eglContext = eglContext,
                 onFirstFrame = {
                     mainHandler.post {
                         if (hostWindow === host && !isHiding) {
-                            animateEntrance(card, scrim, pip, startFullscreen)
+                            animateEntrance(card, this, scrim, pip, startFullscreen)
                             onFirstFrameVisible()
                         }
                     }
@@ -277,36 +282,36 @@ class OverlayManager(private val context: Context) {
                 card.elevation = 0f
                 scrim.animate()
                     .alpha(0.95f)
-                    .setDuration(320L)
+                    .setDuration(380L)
                     .setInterpolator(morphEase)
                     .start()
 
-                animateCornerRadius(card, currentCornerRadiusPx, 0f, 340L)
+                animateCornerRadius(card, currentCornerRadiusPx, 0f, 400L)
 
                 card.animate()
                     .scaleX(1f)
                     .scaleY(1f)
                     .translationX(0f)
                     .translationY(0f)
-                    .setDuration(360L)
+                    .setDuration(420L)
                     .setInterpolator(morphEase)
                     .start()
             } else {
                 card.elevation = dp(18).toFloat()
                 scrim.animate()
                     .alpha(0f)
-                    .setDuration(260L)
+                    .setDuration(320L)
                     .setInterpolator(morphEase)
                     .start()
 
-                animateCornerRadius(card, currentCornerRadiusPx, pip.unscaledCornerRadius, 300L)
+                animateCornerRadius(card, currentCornerRadiusPx, pip.unscaledCornerRadius, 360L)
 
                 card.animate()
                     .scaleX(pip.scaleX)
                     .scaleY(pip.scaleY)
                     .translationX(pip.x)
                     .translationY(pip.y)
-                    .setDuration(320L)
+                    .setDuration(380L)
                     .setInterpolator(morphEase)
                     .start()
             }
@@ -324,23 +329,26 @@ class OverlayManager(private val context: Context) {
                 onDismissCallback?.invoke()
                 return@post
             }
+            val video = renderer
             isHiding = true
             dismissRunnable?.let { mainHandler.removeCallbacks(it) }
             dismissRunnable = null
             card.animate().cancel()
+            video?.animate()?.cancel()
             scrim?.animate()?.cancel()
             cornerAnimator?.cancel()
 
-            scrim?.animate()?.alpha(0f)?.setDuration(220L)?.setInterpolator(exitEase)?.start()
+            scrim?.animate()?.alpha(0f)?.setDuration(240L)?.setInterpolator(exitEase)?.start()
+            video?.animate()?.alpha(0f)?.setDuration(240L)?.setInterpolator(exitEase)?.start()
 
             if (isFullscreen) {
                 card.pivotX = screenW / 2f
                 card.pivotY = screenH / 2f
                 card.animate()
                     .alpha(0f)
-                    .scaleX(0.96f)
-                    .scaleY(0.96f)
-                    .setDuration(220L)
+                    .scaleX(0.95f)
+                    .scaleY(0.95f)
+                    .setDuration(260L)
                     .setInterpolator(exitEase)
                     .withEndAction {
                         val cb = onDismissCallback
@@ -350,15 +358,15 @@ class OverlayManager(private val context: Context) {
                     .start()
             } else {
                 val pip = computePipTransform(cfg)
-                val slideOutX = pip.x + edgeSlideDeltaPx(cfg) * 0.85f
+                val slideOutX = pip.x + edgeSlideDeltaPx(cfg) * 0.9f
                 card.pivotX = 0f
                 card.pivotY = 0f
                 card.animate()
                     .alpha(0f)
                     .translationX(slideOutX)
-                    .scaleX(pip.scaleX * 0.94f)
-                    .scaleY(pip.scaleY * 0.94f)
-                    .setDuration(240L)
+                    .scaleX(pip.scaleX * 0.93f)
+                    .scaleY(pip.scaleY * 0.93f)
+                    .setDuration(260L)
                     .setInterpolator(exitEase)
                     .withEndAction {
                         val cb = onDismissCallback
@@ -402,11 +410,18 @@ class OverlayManager(private val context: Context) {
         }
     }
 
-    private fun animateEntrance(card: FrameLayout, scrim: View, pip: PipTransform, fullscreen: Boolean) {
+    private fun animateEntrance(
+        card: FrameLayout,
+        videoView: TextureViewRenderer,
+        scrim: View,
+        pip: PipTransform,
+        fullscreen: Boolean,
+    ) {
         val cfg = currentCfg ?: return
         if (fullscreen) {
+            card.elevation = 0f
             scrim.alpha = 0f
-            scrim.animate().alpha(0.95f).setDuration(280L).setInterpolator(enterEase).start()
+            scrim.animate().alpha(0.95f).setDuration(320L).setInterpolator(enterEase).start()
 
             card.pivotX = screenW / 2f
             card.pivotY = screenH / 2f
@@ -415,22 +430,25 @@ class OverlayManager(private val context: Context) {
             card.scaleX = 0.95f
             card.scaleY = 0.95f
             card.alpha = 0f
+            videoView.alpha = 0f
+            videoView.animate().alpha(1f).setDuration(320L).setInterpolator(enterEase).start()
             card.animate()
                 .alpha(1f)
                 .scaleX(1f)
                 .scaleY(1f)
-                .setDuration(300L)
+                .setDuration(340L)
                 .setInterpolator(enterEase)
                 .start()
             return
         }
 
-        // Silky Apple TV slide-and-settle from corner edge on the unclipped full-screen GPU canvas
+        // Silky Apple TV slide-and-fade from corner edge (animating videoView.alpha directly!)
         val startScaleX = pip.scaleX * 0.92f
         val startScaleY = pip.scaleY * 0.92f
         val startX = pip.x + edgeSlideDeltaPx(cfg)
         val startY = pip.y + (cfg.overlayHeightPx * 0.04f)
 
+        card.elevation = dp(18).toFloat()
         card.pivotX = 0f
         card.pivotY = 0f
         card.translationX = startX
@@ -438,6 +456,13 @@ class OverlayManager(private val context: Context) {
         card.scaleX = startScaleX
         card.scaleY = startScaleY
         card.alpha = 0f
+        videoView.alpha = 0f
+
+        videoView.animate()
+            .alpha(1f)
+            .setDuration(340L)
+            .setInterpolator(enterEase)
+            .start()
 
         card.animate()
             .alpha(1f)
@@ -445,7 +470,7 @@ class OverlayManager(private val context: Context) {
             .translationY(pip.y)
             .scaleX(pip.scaleX)
             .scaleY(pip.scaleY)
-            .setDuration(360L)
+            .setDuration(380L)
             .setInterpolator(enterEase)
             .start()
     }
