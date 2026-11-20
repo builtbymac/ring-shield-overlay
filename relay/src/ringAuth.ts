@@ -37,29 +37,40 @@ export class RingAuthManager {
   }
 
   get mode(): 'access_token' | 'refresh_token' | 'unconfigured' {
-    if (this.cfg.accessToken) return 'access_token'
     if (this.currentRefreshToken) return 'refresh_token'
+    if (this.cfg.accessToken) return 'access_token'
     return 'unconfigured'
   }
 
+  /**
+   * Installs fresh OAuth tokens obtained from Ring's one-way account linking flow,
+   * persists the refresh token to disk, and arms proactive renewal immediately.
+   */
+  installTokens(accessToken: string, refreshToken: string, expiresInSec = 14_400): void {
+    this.currentRefreshToken = refreshToken
+    this.persistRefreshToken(refreshToken)
+    const refreshLeadMs = Math.min(90_000, Math.floor((expiresInSec * 1000) / 4))
+    this.cached = {
+      token: accessToken,
+      expiresAtMs: Date.now() + expiresInSec * 1000 - refreshLeadMs,
+    }
+    this.scheduleProactiveRefresh(expiresInSec * 1000 - refreshLeadMs)
+    console.log(`[auth] Installed linked OAuth tokens (expires_in=${expiresInSec}s, persisted to ${this.cfg.tokenStorePath})`)
+  }
+
   async getAccessToken(): Promise<string> {
-    if (this.cfg.accessToken && this.cfg.refreshToken) {
-      throw new Error('Set either RING_ACCESS_TOKEN or RING_REFRESH_TOKEN, not both.')
+    if (this.currentRefreshToken) {
+      if (this.cached && Date.now() < this.cached.expiresAtMs) {
+        return this.cached.token
+      }
+      return this.refreshAccessToken()
     }
 
     if (this.cfg.accessToken) {
       return this.cfg.accessToken
     }
 
-    if (!this.currentRefreshToken) {
-      throw new Error('No Ring credentials configured (set RING_ACCESS_TOKEN or RING_REFRESH_TOKEN).')
-    }
-
-    if (this.cached && Date.now() < this.cached.expiresAtMs) {
-      return this.cached.token
-    }
-
-    return this.refreshAccessToken()
+    throw new Error('No Ring credentials configured (link your Private App or set RING_ACCESS_TOKEN / RING_REFRESH_TOKEN).')
   }
 
   /** Pre-warm the access token and schedule proactive renewal 90 s before expiry. */

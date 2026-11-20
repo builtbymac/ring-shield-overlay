@@ -1,4 +1,5 @@
 import http from 'node:http'
+import { AccountLinker } from './accountLink.js'
 import { loadConfig } from './config.js'
 import { RingAuthManager } from './ringAuth.js'
 import {
@@ -47,6 +48,7 @@ function checkLanAuth(req: http.IncomingMessage, lanToken?: string): boolean {
 async function main(): Promise<void> {
   const cfg = loadConfig()
   const auth = new RingAuthManager(cfg)
+  const linker = new AccountLinker(cfg, auth)
   const dedupe = new RequestIdCache(1000)
 
   const server = http.createServer(async (req, res) => {
@@ -101,6 +103,45 @@ async function main(): Promise<void> {
           `[webhook] type=${event.event_type} device=${event.device_id} delivered=${delivered} raw_keys=${Object.keys(parsed).join(',')}`,
         )
         sendJson(res, 200, { status: 'ok', event_id: event.event_id, delivered })
+        return
+      }
+
+      // Ring Private App One-Way Account Linking endpoints (HTTPS via Cloudflare Tunnel)
+      if (method === 'POST' && url.pathname === '/ring/token-exchange') {
+        const rawBody = await readRawBody(req)
+        const ct = String(req.headers['content-type'] ?? '')
+        await linker.handleTokenExchange(rawBody, ct)
+        sendJson(res, 200, { status: 'ok' })
+        return
+      }
+
+      if (method === 'GET' && url.pathname === '/ring/link') {
+        const { status, html } = linker.renderLinkPage(
+          url.searchParams.get('nonce'),
+          url.searchParams.get('time'),
+        )
+        res.writeHead(status, { 'Content-Type': 'text/html; charset=utf-8' })
+        res.end(html)
+        return
+      }
+
+      if (method === 'POST' && url.pathname === '/ring/complete-link') {
+        const rawBody = await readRawBody(req)
+        const body = JSON.parse(rawBody.toString('utf8')) as {
+          nonce?: string
+          time?: string
+          email?: string
+          passcode?: string
+        }
+        const result = await linker.completeLinking(body)
+        sendJson(res, 200, { status: 'completed', ...result })
+        return
+      }
+
+      if (method === 'GET' && url.pathname === '/ring/home') {
+        const html = `<!doctype html><html><body style="font-family:system-ui;background:#0f141c;color:#e6edf3;padding:32px"><h1>Ring → Nvidia Shield Pro Relay</h1><p>Auth mode: <b>${auth.mode}</b> • Connected Shields: <b>${hub.clientCount}</b></p></body></html>`
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
+        res.end(html)
         return
       }
 

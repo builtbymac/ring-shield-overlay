@@ -11,6 +11,7 @@ export interface RelayConfig {
   webhookSecret?: string
   defaultDeviceId?: string
   lanToken?: string
+  linkPasscode?: string
   tokenStorePath: string
 }
 
@@ -32,6 +33,7 @@ export function loadConfig(): RelayConfig {
     webhookSecret: opt('RING_WEBHOOK_SECRET'),
     defaultDeviceId: opt('RING_DEVICE_ID'),
     lanToken: opt('RELAY_LAN_TOKEN'),
+    linkPasscode: opt('LINK_PASSCODE') ?? opt('RELAY_LAN_TOKEN'),
     tokenStorePath: opt('TOKEN_STORE_PATH') || './data/tokens.json',
   }
 }

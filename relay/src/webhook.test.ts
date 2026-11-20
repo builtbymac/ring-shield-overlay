@@ -2,6 +2,11 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import crypto from 'node:crypto'
 import {
+  computeLinkingNonce,
+  maskEmail,
+  timingSafeEquals,
+} from './accountLink.js'
+import {
   normalizeWebhookPayload,
   RequestIdCache,
   verifyHmacSignature,
@@ -55,4 +60,25 @@ test('RequestIdCache deduplicates repeated webhook request_ids', () => {
   assert.equal(cache.isDuplicate('b'), false)
   assert.equal(cache.isDuplicate('c'), false) // evicts 'a'
   assert.equal(cache.isDuplicate('a'), false)
+})
+
+test('computeLinkingNonce produces URL-safe unpadded base64 HMAC-SHA256', () => {
+  const key = 'secret-hmac-key'
+  const timeMs = '1771130906289'
+  const accountId = 'ava1.ring.account.TEST123'
+  const expected = crypto
+    .createHmac('sha256', Buffer.from(key, 'utf8'))
+    .update(`${timeMs}:${accountId}`, 'utf8')
+    .digest('base64url')
+
+  const actual = computeLinkingNonce(key, timeMs, accountId)
+  assert.equal(actual, expected)
+  assert.equal(actual.includes('='), false)
+  assert.equal(timingSafeEquals(actual, expected), true)
+  assert.equal(timingSafeEquals(actual, expected + 'x'), false)
+})
+
+test('maskEmail obfuscates email local part for Ring account_identifier', () => {
+  assert.equal(maskEmail('alex@example.com'), 'a***x@example.com')
+  assert.equal(maskEmail('al@example.com'), 'a***@example.com')
 })
