@@ -35,6 +35,10 @@ export async function startWhepSession(
 
   const sdpAnswer = await res.text()
   const sessionUrl = res.headers.get('location')
+  const summaryLines = sdpAnswer
+    .split(/\r?\n/)
+    .filter((l) => /^(m=|a=rtpmap:|a=fmtp:|a=candidate:|a=(sendrecv|recvonly|sendonly|inactive))/.test(l))
+  console.log(`[whep] Answer SDP summary (${summaryLines.length} lines):\n  ${summaryLines.slice(0, 14).join('\n  ')}`)
   return { sdpAnswer, sessionUrl, ringRttMs }
 }
 

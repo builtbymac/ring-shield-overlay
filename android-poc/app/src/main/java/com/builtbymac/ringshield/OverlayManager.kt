@@ -29,14 +29,19 @@ class OverlayManager(private val context: Context) {
 
     private var rootWindow: FrameLayout? = null
     private var renderer: TextureViewRenderer? = null
+    private var badgeView: TextView? = null
     private var dismissRunnable: Runnable? = null
 
     fun canDrawOverlays(): Boolean = runCatching { Settings.canDrawOverlays(context) }.getOrDefault(false)
 
+    fun setStatusText(text: String) {
+        mainHandler.post { badgeView?.text = text }
+    }
+
     /**
-     * Attaches the TextureView overlay window (initially invisible at alpha 0 until the
-     * first decoded WebRTC frame renders, or immediately visible if preferred) and returns
-     * the VideoSink renderer ready to attach to the incoming VideoTrack.
+     * Attaches the TextureView overlay window immediately (visible with a live status badge
+     * during PoC diagnostics so we can verify overlay rendering even while WebRTC connects)
+     * and returns the VideoSink renderer ready to attach to the incoming VideoTrack.
      */
     fun showOverlay(
         cfg: PocConfig,
@@ -52,7 +57,7 @@ class OverlayManager(private val context: Context) {
         hideImmediate()
 
         val card = FrameLayout(context).apply {
-            alpha = 0f
+            alpha = 1f
             background = GradientDrawable().apply {
                 shape = GradientDrawable.RECTANGLE
                 cornerRadius = 18f
@@ -73,7 +78,7 @@ class OverlayManager(private val context: Context) {
                 onFirstFrame = {
                     mainHandler.post {
                         if (rootWindow === card) {
-                            card.animate().alpha(1f).setDuration(120L).start()
+                            badgeView?.text = "LIVE • DOORBELL"
                             onFirstFrameVisible()
                         }
                     }
@@ -82,7 +87,7 @@ class OverlayManager(private val context: Context) {
         }
 
         val badge = TextView(context).apply {
-            text = "LIVE • DOORBELL"
+            text = "CONNECTING…"
             setTextColor(Color.WHITE)
             textSize = 12f
             typeface = Typeface.DEFAULT_BOLD
@@ -93,6 +98,7 @@ class OverlayManager(private val context: Context) {
                 setColor(Color.parseColor("#CC1976D2"))
             }
         }
+        badgeView = badge
 
         card.addView(
             videoView,
@@ -140,6 +146,7 @@ class OverlayManager(private val context: Context) {
 
         val r = renderer
         renderer = null
+        badgeView = null
         runCatching { r?.release() }
 
         val w = rootWindow

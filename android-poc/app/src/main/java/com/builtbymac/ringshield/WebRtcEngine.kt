@@ -86,10 +86,12 @@ class WebRtcEngine(
         val iceServers = listOf(
             PeerConnection.IceServer.builder("stun:stun.l.google.com:19302").createIceServer(),
             PeerConnection.IceServer.builder("stun:stun1.l.google.com:19302").createIceServer(),
+            PeerConnection.IceServer.builder("stun:stun.kinesisvideo.us-east-1.amazonaws.com:443").createIceServer(),
         )
         val rtcConfig = PeerConnection.RTCConfiguration(iceServers).apply {
             sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN
-            bundlePolicy = PeerConnection.BundlePolicy.MAXBUNDLE
+            // Match Amazon's official ring-api-helloworld (BALANCED, not MAXBUNDLE)
+            bundlePolicy = PeerConnection.BundlePolicy.BALANCED
             continualGatheringPolicy = PeerConnection.ContinualGatheringPolicy.GATHER_ONCE
         }
 
@@ -97,19 +99,18 @@ class WebRtcEngine(
             rtcConfig,
             object : PeerConnection.Observer {
                 override fun onIceCandidate(candidate: IceCandidate) {
-                    if (candidate.sdp.contains(" typ srflx ")) {
-                        srflxOrComplete.complete(Unit)
-                    }
+                    Log.d(TAG, "Gathered ICE candidate: ${candidate.sdp}")
                 }
 
                 override fun onIceGatheringChange(state: PeerConnection.IceGatheringState) {
+                    Log.d(TAG, "ICE gathering -> $state")
                     if (state == PeerConnection.IceGatheringState.COMPLETE) {
                         srflxOrComplete.complete(Unit)
                     }
                 }
 
                 override fun onIceConnectionChange(state: PeerConnection.IceConnectionState) {
-                    Log.d(TAG, "ICE state -> $state")
+                    Log.i(TAG, "ICE connection -> $state")
                     if (state == PeerConnection.IceConnectionState.CONNECTED ||
                         state == PeerConnection.IceConnectionState.COMPLETED
                     ) {
@@ -118,7 +119,9 @@ class WebRtcEngine(
                 }
 
                 override fun onTrack(transceiver: RtpTransceiver) {
-                    when (val track = transceiver.receiver.track()) {
+                    val track = transceiver.receiver.track()
+                    Log.i(TAG, "onTrack: kind=${track?.kind()} id=${track?.id()} enabled=${track?.enabled()}")
+                    when (track) {
                         is VideoTrack -> {
                             track.setEnabled(true)
                             videoTrackDeferred.complete(track)
@@ -142,9 +145,10 @@ class WebRtcEngine(
         ) ?: error("PeerConnectionFactory.createPeerConnection returned null")
 
         if (cfg.includeAudioTransceiver) {
+            // Match official ring-api-helloworld: audio sendrecv (mic & speaker muted at ADM)
             pc.addTransceiver(
                 MediaStreamTrack.MediaType.MEDIA_TYPE_AUDIO,
-                RtpTransceiver.RtpTransceiverInit(RtpTransceiver.RtpTransceiverDirection.RECV_ONLY)
+                RtpTransceiver.RtpTransceiverInit(RtpTransceiver.RtpTransceiverDirection.SEND_RECV)
             )
         }
         pc.addTransceiver(
@@ -153,14 +157,15 @@ class WebRtcEngine(
         )
 
         val offer = createOfferSuspend(pc)
-        // Always pass the exact unmodified offer to setLocalDescription (libwebrtc Unified Plan
-        // rejects SDP mutations like removed extmap/empty lines on setLocalDescription).
         setLocalDescriptionSuspend(pc, offer)
 
-        // Wait briefly for first srflx candidate or completion (capped by iceGatherBudgetMs)
+        // Wait for ICE gathering to finish (bounded by iceGatherBudgetMs) so all host + srflx
+        // candidates are embedded in the single WHEP POST offer.
         withTimeoutOrNull(cfg.iceGatherBudgetMs) { srflxOrComplete.await() }
 
         val gatheredSdp = pc.localDescription?.description ?: offer.description
+        val candCount = gatheredSdp.lineSequence().count { it.startsWith("a=candidate:") }
+        Log.i(TAG, "Offer ready with $candCount ICE candidate(s)")
         val finalSdp = if (cfg.stripTwcc) stripTwccFromSdp(gatheredSdp) else gatheredSdp
         return PrewarmedOffer(
             peerConnection = pc,

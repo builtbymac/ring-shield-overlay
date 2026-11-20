@@ -201,20 +201,27 @@ class DoorbellOverlayService : Service() {
                         }
                     },
                     onAutoDismiss = {
+                        if (!trial.success && trial.error == null) {
+                            trial.error = "overlay_timeout_no_video_frame"
+                            latencyLogger.record(trial)
+                        }
                         stopActiveStream()
                     }
                 ) ?: error("Overlay permission missing (grant SYSTEM_ALERT_WINDOW)")
 
+                overlayManager.setStatusText("GATHERING ICE…")
                 val offer = freshPrewarm ?: webrtc.prepareOffer(cfg)
                 activeOffer = offer
                 trial.iceReadyMonoMs = SystemClock.elapsedRealtime()
 
+                overlayManager.setStatusText("CALLING RING WHEP…")
                 trial.whepSentMonoMs = SystemClock.elapsedRealtime()
                 val answer = relay.startWhep(deviceId, offer.sdpOffer)
                 trial.whepAnswerMonoMs = SystemClock.elapsedRealtime()
                 trial.ringServerRttMs = answer.ringRttMs
                 activeSessionUrl = answer.sessionUrl
 
+                overlayManager.setStatusText("CONNECTING WEBRTC…")
                 webrtc.applyAnswer(offer, answer.sdpAnswer, cfg.stripTwcc)
 
                 // Wait for remote VideoTrack & attach directly to GPU TextureViewRenderer
@@ -223,8 +230,28 @@ class DoorbellOverlayService : Service() {
                     webrtc.attachVideoSink(videoTrack, renderer)
                 }
 
-                // Track ICE connection time for telemetry (non-blocking if already connected)
+                // Track ICE connection time for telemetry
                 trial.iceConnectedMonoMs = withTimeout(10_000L) { offer.iceConnectedDeferred.await() }
+                if (!trial.success) {
+                    overlayManager.setStatusText("ICE OK • DECODING…")
+                }
+
+                // Log inbound RTP/decoder stats after 3 s for PoC diagnostics
+                delay(3_000L)
+                offer.peerConnection.getStats { report ->
+                    report.statsMap.values
+                        .filter { it.type == "inbound-rtp" && it.members["kind"] == "video" }
+                        .forEach { s ->
+                            Log.i(
+                                TAG,
+                                "RTC video stats: pkts=${s.members["packetsReceived"]} " +
+                                    "bytes=${s.members["bytesReceived"]} " +
+                                    "decoded=${s.members["framesDecoded"]} " +
+                                    "dropped=${s.members["framesDropped"]} " +
+                                    "impl=${s.members["decoderImplementation"]}"
+                            )
+                        }
+                }
             } catch (ex: Throwable) {
                 Log.e(TAG, "Doorbell overlay session failed: ${ex.message}", ex)
                 trial.error = ex.message ?: ex.javaClass.simpleName

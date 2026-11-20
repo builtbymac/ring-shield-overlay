@@ -19,9 +19,9 @@ data class PocConfig(
     val overlayWidthPx: Int = 640,
     val overlayHeightPx: Int = 360,
     val softwareDecoder: Boolean = false,
-    val stripTwcc: Boolean = true,
+    val stripTwcc: Boolean = false,
     val includeAudioTransceiver: Boolean = true,
-    val iceGatherBudgetMs: Long = 250L,
+    val iceGatherBudgetMs: Long = 1500L,
     val prewarmTtlMs: Long = 25_000L,
 )
 
@@ -53,9 +53,9 @@ object ConfigStore {
                 overlayWidthPx = json.optInt("overlayWidthPx", 640).coerceIn(240, 1920),
                 overlayHeightPx = json.optInt("overlayHeightPx", 360).coerceIn(135, 1080),
                 softwareDecoder = json.optBoolean("softwareDecoder", false),
-                stripTwcc = json.optBoolean("stripTwcc", true),
+                stripTwcc = json.optBoolean("stripTwcc", false),
                 includeAudioTransceiver = json.optBoolean("includeAudioTransceiver", true),
-                iceGatherBudgetMs = json.optLong("iceGatherBudgetMs", 250L).coerceIn(50L, 3000L),
+                iceGatherBudgetMs = json.optLong("iceGatherBudgetMs", 1500L).coerceIn(50L, 5000L),
                 prewarmTtlMs = json.optLong("prewarmTtlMs", 25_000L).coerceIn(5_000L, 60_000L),
             )
         } catch (ex: Throwable) {
