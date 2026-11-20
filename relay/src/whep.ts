@@ -2,6 +2,12 @@ import { performance } from 'node:perf_hooks'
 import { fetch as undiciFetch } from 'undici'
 import { RING_API_BASE, RingAuthManager, upstreamAgent } from './ringAuth.js'
 
+// Ring WAF requires User-Agent & Hardware_Id headers to avoid 406 Not Acceptable
+const RING_CLIENT_HEADERS = {
+  'User-Agent': 'ShieldDoorbellOverlay/0.1.0',
+  Hardware_Id: '9f8e7d6c-5b4a-4321-9876-543210fedcba',
+}
+
 export interface WhepStartResult {
   sdpAnswer: string
   sessionUrl: string | null
@@ -20,6 +26,7 @@ export async function startWhepSession(
   const res = await undiciFetch(whepUrl, {
     method: 'POST',
     headers: {
+      ...RING_CLIENT_HEADERS,
       Authorization: `Bearer ${token}`,
       'Content-Type': 'application/sdp',
     },
@@ -55,7 +62,7 @@ export async function stopWhepSession(
   const token = await auth.getAccessToken()
   const res = await undiciFetch(sessionUrl, {
     method: 'DELETE',
-    headers: { Authorization: `Bearer ${token}` },
+    headers: { ...RING_CLIENT_HEADERS, Authorization: `Bearer ${token}` },
     dispatcher: upstreamAgent,
   })
   if (!res.ok && res.status !== 404) {
@@ -68,7 +75,7 @@ export async function discoverDevices(auth: RingAuthManager): Promise<unknown[]>
   const token = await auth.getAccessToken()
   const res = await undiciFetch(`${RING_API_BASE}/v1/devices`, {
     method: 'GET',
-    headers: { Authorization: `Bearer ${token}` },
+    headers: { ...RING_CLIENT_HEADERS, Authorization: `Bearer ${token}` },
     dispatcher: upstreamAgent,
   })
   if (!res.ok) {

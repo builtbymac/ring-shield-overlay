@@ -57,12 +57,13 @@ class OverlayManager(private val context: Context) {
         hideImmediate()
 
         val card = FrameLayout(context).apply {
-            alpha = 1f
+            // Stay invisible until the first decoded video frame arrives, then fade in cleanly
+            alpha = 0f
             background = GradientDrawable().apply {
                 shape = GradientDrawable.RECTANGLE
                 cornerRadius = 18f
-                setColor(Color.parseColor("#E610141A"))
-                setStroke(3, Color.parseColor("#FF2979FF"))
+                setColor(Color.parseColor("#FF0B0E14"))
+                setStroke(2, Color.parseColor("#66FFFFFF"))
             }
             outlineProvider = object : ViewOutlineProvider() {
                 override fun getOutline(view: View, outline: Outline) {
@@ -78,7 +79,8 @@ class OverlayManager(private val context: Context) {
                 onFirstFrame = {
                     mainHandler.post {
                         if (rootWindow === card) {
-                            badgeView?.text = "LIVE • DOORBELL"
+                            badgeView?.text = "LIVE • FRONT DOOR"
+                            card.animate().alpha(1f).setDuration(150L).start()
                             onFirstFrameVisible()
                         }
                     }
@@ -87,11 +89,11 @@ class OverlayManager(private val context: Context) {
         }
 
         val badge = TextView(context).apply {
-            text = "CONNECTING…"
+            text = "LIVE • FRONT DOOR"
             setTextColor(Color.WHITE)
-            textSize = 12f
+            textSize = 11f
             typeface = Typeface.DEFAULT_BOLD
-            setPadding(16, 6, 16, 6)
+            setPadding(14, 5, 14, 5)
             background = GradientDrawable().apply {
                 shape = GradientDrawable.RECTANGLE
                 cornerRadius = 999f

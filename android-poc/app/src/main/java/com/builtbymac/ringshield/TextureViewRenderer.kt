@@ -31,7 +31,8 @@ class TextureViewRenderer(context: Context) : TextureView(context),
 
     init {
         surfaceTextureListener = this
-        isOpaque = false
+        // Opaque TextureView skips per-frame alpha compositing over playing YouTube/HDR video
+        isOpaque = true
     }
 
     fun init(

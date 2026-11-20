@@ -42,6 +42,8 @@ class DoorbellOverlayService : Service() {
 
     private var prewarmedOffer: PrewarmedOffer? = null
     private var activeOffer: PrewarmedOffer? = null
+    private var activeVideoTrack: org.webrtc.VideoTrack? = null
+    private var activeRenderer: TextureViewRenderer? = null
     private var activeSessionUrl: String? = null
 
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
@@ -227,6 +229,8 @@ class DoorbellOverlayService : Service() {
                 // Wait for remote VideoTrack & attach directly to GPU TextureViewRenderer
                 val videoTrack = withTimeout(10_000L) { offer.videoTrackDeferred.await() }
                 withContext(Dispatchers.Main.immediate) {
+                    activeVideoTrack = videoTrack
+                    activeRenderer = renderer
                     webrtc.attachVideoSink(videoTrack, renderer)
                 }
 
@@ -236,21 +240,32 @@ class DoorbellOverlayService : Service() {
                     overlayManager.setStatusText("ICE OK • DECODING…")
                 }
 
-                // Log inbound RTP/decoder stats after 3 s for PoC diagnostics
-                delay(3_000L)
-                offer.peerConnection.getStats { report ->
-                    report.statsMap.values
-                        .filter { it.type == "inbound-rtp" && it.members["kind"] == "video" }
-                        .forEach { s ->
-                            Log.i(
-                                TAG,
-                                "RTC video stats: pkts=${s.members["packetsReceived"]} " +
-                                    "bytes=${s.members["bytesReceived"]} " +
-                                    "decoded=${s.members["framesDecoded"]} " +
-                                    "dropped=${s.members["framesDropped"]} " +
-                                    "impl=${s.members["decoderImplementation"]}"
-                            )
-                        }
+                // Log detailed inbound-rtp jitter/freeze/loss stats every 4 s for diagnostics
+                repeat(5) { sampleIdx ->
+                    delay(4_000L)
+                    if (activeOffer !== offer) return@repeat
+                    offer.peerConnection.getStats { report ->
+                        report.statsMap.values
+                            .filter { it.type == "inbound-rtp" && it.members["kind"] == "video" }
+                            .forEach { s ->
+                                val jbDelay = (s.members["jitterBufferDelay"] as? Number)?.toDouble()
+                                val jbEmitted = (s.members["jitterBufferEmittedCount"] as? Number)?.toDouble()
+                                val avgJbMs = if (jbDelay != null && jbEmitted != null && jbEmitted > 0) {
+                                    "%.1f".format((jbDelay / jbEmitted) * 1000.0)
+                                } else "n/a"
+                                val jitterMs = (s.members["jitter"] as? Number)?.toDouble()?.let { "%.1f".format(it * 1000.0) } ?: "n/a"
+                                Log.i(
+                                    TAG,
+                                    "RTC stats[#${sampleIdx + 1}]: " +
+                                        "${s.members["frameWidth"]}x${s.members["frameHeight"]}@${s.members["framesPerSecond"]}fps " +
+                                        "dec=${s.members["framesDecoded"]} drop=${s.members["framesDropped"]} " +
+                                        "freezes=${s.members["freezeCount"]}(${s.members["totalFreezesDuration"]}s) " +
+                                        "pkts=${s.members["packetsReceived"]} lost=${s.members["packetsLost"]} " +
+                                        "nack=${s.members["nackCount"]} pli=${s.members["pliCount"]} " +
+                                        "jitter=${jitterMs}ms jb=${avgJbMs}ms impl=${s.members["decoderImplementation"]}"
+                                )
+                            }
+                    }
                 }
             } catch (ex: Throwable) {
                 Log.e(TAG, "Doorbell overlay session failed: ${ex.message}", ex)
@@ -262,6 +277,14 @@ class DoorbellOverlayService : Service() {
     }
 
     private fun stopActiveStream() {
+        val track = activeVideoTrack
+        val rend = activeRenderer
+        activeVideoTrack = null
+        activeRenderer = null
+        if (track != null && rend != null) {
+            runCatching { track.removeSink(rend) }
+        }
+
         overlayManager.hideImmediate()
 
         val offer = activeOffer
