@@ -31,6 +31,7 @@ data class WhepResponse(
 class RelayClient(
     private val cfg: PocConfig,
     private val onEvent: (RelayRingEvent) -> Unit,
+    private val onCommand: (String) -> Unit,
     private val onConnectionChanged: (Boolean) -> Unit,
 ) {
     private val http = OkHttpClient.Builder()
@@ -69,18 +70,25 @@ class RelayClient(
                 if (mySeq != connSeq.get()) return
                 runCatching {
                     val root = JSONObject(text)
-                    if (root.optString("kind") != "ring_event") return
-                    val ev = root.getJSONObject("event")
-                    onEvent(
-                        RelayRingEvent(
-                            eventId = ev.optString("event_id", "unknown"),
-                            eventType = ev.optString("event_type", "unknown"),
-                            deviceId = if (ev.isNull("device_id")) null else ev.optString("device_id", "").takeIf { it.isNotBlank() && it != "null" },
-                            ringEventTsMs = if (ev.isNull("ring_event_ts_ms")) null else ev.optLong("ring_event_ts_ms"),
-                            relayRxTsMs = if (ev.isNull("relay_rx_ts_ms")) null else ev.optLong("relay_rx_ts_ms"),
-                            synthetic = ev.optBoolean("synthetic", false),
-                        )
-                    )
+                    when (root.optString("kind")) {
+                        "overlay_command" -> {
+                            val action = root.optString("action", "").trim()
+                            if (action.isNotBlank()) onCommand(action)
+                        }
+                        "ring_event" -> {
+                            val ev = root.getJSONObject("event")
+                            onEvent(
+                                RelayRingEvent(
+                                    eventId = ev.optString("event_id", "unknown"),
+                                    eventType = ev.optString("event_type", "unknown"),
+                                    deviceId = if (ev.isNull("device_id")) null else ev.optString("device_id", "").takeIf { it.isNotBlank() && it != "null" },
+                                    ringEventTsMs = if (ev.isNull("ring_event_ts_ms")) null else ev.optLong("ring_event_ts_ms"),
+                                    relayRxTsMs = if (ev.isNull("relay_rx_ts_ms")) null else ev.optLong("relay_rx_ts_ms"),
+                                    synthetic = ev.optBoolean("synthetic", false),
+                                )
+                            )
+                        }
+                    }
                 }.onFailure { Log.e(TAG, "Malformed relay message: ${it.message}") }
             }
 

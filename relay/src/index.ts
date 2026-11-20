@@ -155,6 +155,21 @@ async function main(): Promise<void> {
         return
       }
 
+      // Overlay remote control command (show | fullscreen | toggle_fullscreen | dismiss)
+      if (method === 'POST' && url.pathname === '/api/overlay/command') {
+        const rawBody = await readRawBody(req)
+        const body = rawBody.length ? (JSON.parse(rawBody.toString('utf8')) as { action?: string }) : {}
+        const action = body.action?.trim()
+        if (!action || !['show', 'fullscreen', 'toggle_fullscreen', 'dismiss'].includes(action)) {
+          sendJson(res, 400, { error: 'action must be one of: show, fullscreen, toggle_fullscreen, dismiss' })
+          return
+        }
+        const delivered = hub.broadcastCommand(action)
+        console.log(`[cmd] Broadcast overlay_command action=${action} -> ${delivered} client(s)`)
+        sendJson(res, 200, { ok: true, action, delivered })
+        return
+      }
+
       // Synthetic trigger for PoC benchmarking (before/alongside live Ring webhooks)
       if (method === 'POST' && url.pathname === '/api/test/trigger') {
         const relayRxTsMs = Date.now()

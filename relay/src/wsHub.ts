@@ -104,6 +104,22 @@ export class ShieldWsHub {
     return delivered
   }
 
+  broadcastCommand(action: string): number {
+    const frame = JSON.stringify({
+      kind: 'overlay_command',
+      relay_tx_ts_ms: Date.now(),
+      action,
+    })
+    let delivered = 0
+    for (const ws of this.wss.clients) {
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(frame)
+        delivered++
+      }
+    }
+    return delivered
+  }
+
   close(): void {
     clearInterval(this.pingTimer)
     this.wss.close()

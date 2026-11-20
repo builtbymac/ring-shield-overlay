@@ -47,6 +47,26 @@
                 android:value="Displays ultra-low-latency Ring doorbell live video overlay on Android TV" />
         </service>
 
+        <receiver
+            android:name=".RemoteCommandReceiver"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="com.builtbymac.ringshield.ACTION_TOGGLE_FULLSCREEN" />
+                <action android:name="com.builtbymac.ringshield.ACTION_SHOW_DOORBELL" />
+                <action android:name="com.builtbymac.ringshield.ACTION_SHOW_FULLSCREEN" />
+                <action android:name="com.builtbymac.ringshield.ACTION_DISMISS" />
+            </intent-filter>
+        </receiver>
+
+        <activity
+            android:name=".QuickToggleActivity"
+            android:excludeFromRecents="true"
+            android:exported="true"
+            android:label="Doorbell PiP / Fullscreen"
+            android:noHistory="true"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+
         <activity
             android:name=".MainActivity"
             android:exported="true"

@@ -60,6 +60,7 @@ class DoorbellOverlayService : Service() {
         relay = RelayClient(
             cfg = cfg,
             onEvent = { ev -> scope.launch { handleRelayEvent(ev) } },
+            onCommand = { cmd -> scope.launch { handleRemoteCommand(cmd) } },
             onConnectionChanged = { connected ->
                 isRelayConnected = connected
                 if (connected) {
@@ -80,21 +81,78 @@ class DoorbellOverlayService : Service() {
         // Always answer startForegroundService() idempotently to avoid RemoteServiceException
         enterForeground()
 
-        if (intent?.action == ACTION_TEST_TRIGGER) {
-            scope.launch {
-                handleRelayEvent(
-                    RelayRingEvent(
-                        eventId = "local_${System.currentTimeMillis()}",
-                        eventType = "button_press",
-                        deviceId = cfg.deviceId.takeIf { it.isNotBlank() },
-                        ringEventTsMs = System.currentTimeMillis(),
-                        relayRxTsMs = System.currentTimeMillis(),
-                        synthetic = true,
-                    )
-                )
+        when (intent?.action) {
+            ACTION_TEST_TRIGGER, ACTION_SHOW_DOORBELL -> {
+                scope.launch { handleRemoteCommand("show") }
+            }
+            ACTION_SHOW_FULLSCREEN -> {
+                scope.launch { handleRemoteCommand("fullscreen") }
+            }
+            ACTION_TOGGLE_FULLSCREEN -> {
+                scope.launch { handleRemoteCommand("toggle_fullscreen") }
+            }
+            ACTION_DISMISS -> {
+                scope.launch { handleRemoteCommand("dismiss") }
+            }
+            ACTION_RELOAD_CONFIG -> {
+                reloadConfig()
             }
         }
         return START_STICKY
+    }
+
+    private fun reloadConfig() {
+        val prev = cfg
+        cfg = ConfigStore.load(this)
+        Log.i(TAG, "Reloaded config.json (corner=${cfg.corner}, size=${cfg.overlayWidthPx}x${cfg.overlayHeightPx}, dur=${cfg.overlayDurationSec}s, crop=${cfg.cropRingWatermark}, dot=${cfg.showLiveDot}, bar=${cfg.showCountdownBar}, delay=${cfg.minPlayoutDelayMs}ms)")
+        if (prev.softwareDecoder != cfg.softwareDecoder || prev.minPlayoutDelayMs != cfg.minPlayoutDelayMs) {
+            stopActiveStream()
+            clearPrewarm()
+            webrtc.release()
+            webrtc = WebRtcEngine(applicationContext, cfg.softwareDecoder, cfg.minPlayoutDelayMs)
+        }
+    }
+
+    private fun handleRemoteCommand(action: String) {
+        Log.i(TAG, "Handling overlay command: $action (showing=${overlayManager.isShowing}, fullscreen=${overlayManager.isFullscreen})")
+        when (action.lowercase()) {
+            "toggle_fullscreen" -> {
+                if (overlayManager.isShowing) {
+                    overlayManager.toggleFullscreen()
+                } else {
+                    triggerOnDemand(startFullscreen = false)
+                }
+            }
+            "show" -> triggerOnDemand(startFullscreen = false)
+            "fullscreen" -> {
+                if (overlayManager.isShowing) {
+                    overlayManager.setFullscreen(true)
+                } else {
+                    triggerOnDemand(startFullscreen = true)
+                }
+            }
+            "dismiss" -> {
+                if (overlayManager.isShowing) {
+                    overlayManager.dismissAnimated()
+                } else {
+                    stopActiveStream()
+                }
+            }
+        }
+    }
+
+    private fun triggerOnDemand(startFullscreen: Boolean) {
+        startDoorbellOverlay(
+            event = RelayRingEvent(
+                eventId = "ondemand_${System.currentTimeMillis()}",
+                eventType = "button_press",
+                deviceId = cfg.deviceId.takeIf { it.isNotBlank() },
+                ringEventTsMs = System.currentTimeMillis(),
+                relayRxTsMs = System.currentTimeMillis(),
+                synthetic = true,
+            ),
+            startFullscreen = startFullscreen,
+        )
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -156,7 +214,7 @@ class DoorbellOverlayService : Service() {
         prewarmedOffer = null
     }
 
-    private fun startDoorbellOverlay(event: RelayRingEvent) {
+    private fun startDoorbellOverlay(event: RelayRingEvent, startFullscreen: Boolean = false) {
         activeSessionJob?.cancel()
         stopActiveStream()
 
@@ -193,6 +251,7 @@ class DoorbellOverlayService : Service() {
                 val renderer = overlayManager.showOverlay(
                     cfg = cfg,
                     eglContext = webrtc.eglBase.eglBaseContext,
+                    startFullscreen = startFullscreen,
                     onFirstFrameVisible = {
                         val now = SystemClock.elapsedRealtime()
                         if (trial.firstFrameMonoMs == null) {
@@ -211,19 +270,16 @@ class DoorbellOverlayService : Service() {
                     }
                 ) ?: error("Overlay permission missing (grant SYSTEM_ALERT_WINDOW)")
 
-                overlayManager.setStatusText("GATHERING ICE…")
                 val offer = freshPrewarm ?: webrtc.prepareOffer(cfg)
                 activeOffer = offer
                 trial.iceReadyMonoMs = SystemClock.elapsedRealtime()
 
-                overlayManager.setStatusText("CALLING RING WHEP…")
                 trial.whepSentMonoMs = SystemClock.elapsedRealtime()
                 val answer = relay.startWhep(deviceId, offer.sdpOffer)
                 trial.whepAnswerMonoMs = SystemClock.elapsedRealtime()
                 trial.ringServerRttMs = answer.ringRttMs
                 activeSessionUrl = answer.sessionUrl
 
-                overlayManager.setStatusText("CONNECTING WEBRTC…")
                 webrtc.applyAnswer(offer, answer.sdpAnswer, cfg.stripTwcc)
 
                 // Wait for remote VideoTrack & attach directly to GPU TextureViewRenderer
@@ -236,9 +292,6 @@ class DoorbellOverlayService : Service() {
 
                 // Track ICE connection time for telemetry
                 trial.iceConnectedMonoMs = withTimeout(10_000L) { offer.iceConnectedDeferred.await() }
-                if (!trial.success) {
-                    overlayManager.setStatusText("ICE OK • DECODING…")
-                }
 
                 // Log detailed inbound-rtp jitter/freeze/loss stats every 4 s for diagnostics
                 repeat(5) { sampleIdx ->
@@ -368,6 +421,11 @@ class DoorbellOverlayService : Service() {
         private const val CHANNEL_ID = "ring_shield_listener"
         private const val NOTIFICATION_ID = 1001
         const val ACTION_TEST_TRIGGER = "com.builtbymac.ringshield.ACTION_TEST_TRIGGER"
+        const val ACTION_SHOW_DOORBELL = "com.builtbymac.ringshield.ACTION_SHOW_DOORBELL"
+        const val ACTION_SHOW_FULLSCREEN = "com.builtbymac.ringshield.ACTION_SHOW_FULLSCREEN"
+        const val ACTION_TOGGLE_FULLSCREEN = "com.builtbymac.ringshield.ACTION_TOGGLE_FULLSCREEN"
+        const val ACTION_DISMISS = "com.builtbymac.ringshield.ACTION_DISMISS"
+        const val ACTION_RELOAD_CONFIG = "com.builtbymac.ringshield.ACTION_RELOAD_CONFIG"
 
         @Volatile var isRelayConnected: Boolean = false
     }
