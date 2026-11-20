@@ -3,9 +3,15 @@ package com.builtbymac.ringshield
 import android.animation.ObjectAnimator
 import android.animation.ValueAnimator
 import android.content.Context
+import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.LinearGradient
 import android.graphics.Outline
+import android.graphics.Paint
 import android.graphics.PixelFormat
+import android.graphics.RadialGradient
+import android.graphics.RectF
+import android.graphics.Shader
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.os.Build
@@ -29,24 +35,21 @@ import android.widget.TextView
 import org.webrtc.EglBase
 
 /**
- * Apple TV-grade, zero-glitch 60 fps interactive PiP & 88% Theater Card overlay for Nvidia Shield Pro.
+ * Apple visionOS / tvOS Liquid Glass 60 fps interactive PiP & 88% Theater Card overlay.
  *
  * Interaction model:
- *  - Instant response (<30 ms): The rounded obsidian card glides onto screen immediately when
- *    triggered with a subtle "Connecting…" indicator while WebRTC negotiates, then cross-fades
- *    smoothly to the live video on the exact SurfaceTexture swap of frame 1.
- *  - Un-hovered PiP mode: Starts clean (pure video only) with a 20-second auto-dismiss timer.
- *    If the user does not navigate to the PiP, it auto-dismisses after 20 seconds.
- *  - Hovered PiP mode: Navigating with the D-pad (or pointer hover) onto the PiP cancels the
- *    20-second auto-dismiss timer ("stays on until dismissed") and animates in a sleek top-right
- *    `✕` dismiss button, a focus border, and a bottom-left `⤢ Fullscreen` pill.
- *      • Clicking the PiP card expands into the 88% Rounded Theater Fullscreen view.
- *      • Navigating to the `✕` button (Right / Up) and clicking it dismisses the PiP.
- *      • Pressing Left / Down un-hovers back to a clean video card (still staying on until dismissed).
- *  - 88% Rounded Theater Fullscreen mode: Stays on until dismissed and presents two sleek floating
- *    glass pill options at the bottom-center of the card:
- *      • `↙  Picture in Picture`: Returns to corner PiP mode and keeps the PiP on screen until dismissed.
- *      • `✕  Dismiss`: Smoothly dismisses the overlay and closes the stream.
+ *  - Corner PiP (Un-hovered): 100% pure video card with 20s auto-dismiss timer.
+ *  - Corner PiP (Hovered):
+ *      • Auto-dismiss is cancelled (stays on until dismissed).
+ *      • When hovering the PiP card itself, the card subtly swells (1.038x) with a directional
+ *        Liquid Glass specular rim highlight — indicating it can be clicked to open Fullscreen
+ *        with zero bottom-left button clutter.
+ *      • A circular Liquid Glass `✕` orb animates into the top-right corner. Pressing Right/Up
+ *        focuses the `✕` orb (which expands 1.16x with a bright specular lens highlight).
+ *  - 88% Rounded Theater Fullscreen:
+ *      • Background content stays at 100% full brightness (zero background dimming).
+ *      • Two compact circular Liquid Glass icon orbs (`PiP Minimize` and `✕ Close`) sit in the
+ *        top-right corner of the card and expand smoothly when hovered/focused.
  */
 class OverlayManager(private val context: Context) {
 
@@ -60,15 +63,19 @@ class OverlayManager(private val context: Context) {
         DISMISS_BTN,
     }
 
+    private enum class GlassIconType {
+        CLOSE_X,
+        PIP_MINIMIZE,
+    }
+
     private val wm = context.getSystemService(Context.WINDOW_SERVICE) as WindowManager
     private val mainHandler = Handler(Looper.getMainLooper())
     private val enterEase = PathInterpolator(0.25f, 0.9f, 0.25f, 1f)
     private val morphEase = PathInterpolator(0.32f, 0.72f, 0f, 1f)
     private val exitEase = PathInterpolator(0.4f, 0f, 0.2f, 1f)
-    private val popSpring = OvershootInterpolator(1.35f)
+    private val popSpring = OvershootInterpolator(1.45f)
 
     private var hostWindow: FrameLayout? = null
-    private var scrimView: View? = null
     private var cardView: FrameLayout? = null
     private var rootParams: WindowManager.LayoutParams? = null
     private var renderer: TextureViewRenderer? = null
@@ -77,24 +84,19 @@ class OverlayManager(private val context: Context) {
     private var screenH: Int = 1080
     private var currentCornerRadiusPx: Float = 0f
 
-    // Connecting indicator inside card before frame 1 swaps in
     private var connectingContainer: View? = null
     private var connectingPulseAnimator: ObjectAnimator? = null
 
-    // PiP hover HUD views (scaled inversely to pip.scaleX for razor-sharp 1:1 1080p rendering)
-    private var pipBorderView: View? = null
-    private var pipBorderDrawable: GradientDrawable? = null
-    private var pipCloseBtn: TextView? = null
-    private var pipCloseDrawable: GradientDrawable? = null
-    private var pipExpandPill: TextView? = null
-    private var pipExpandDrawable: GradientDrawable? = null
+    // Liquid Glass card specular rim border
+    private var glassRimView: LiquidGlassRimView? = null
 
-    // Fullscreen HUD views (scaled inversely to exp.scaleX for 1:1 1080p rendering)
-    private var fsHudDock: LinearLayout? = null
-    private var fsPipBtn: TextView? = null
-    private var fsPipDrawable: GradientDrawable? = null
-    private var fsDismissBtn: TextView? = null
-    private var fsDismissDrawable: GradientDrawable? = null
+    // PiP top-right Liquid Glass `✕` orb
+    private var pipCloseOrb: LiquidGlassOrbButton? = null
+
+    // Fullscreen top-right Liquid Glass icon orbs (PiP Minimize + Close `✕`)
+    private var fsTopRightRow: LinearLayout? = null
+    private var fsPipOrb: LiquidGlassOrbButton? = null
+    private var fsCloseOrb: LiquidGlassOrbButton? = null
 
     private var dotAnimator: ObjectAnimator? = null
     private var cornerAnimator: ValueAnimator? = null
@@ -172,30 +174,12 @@ class OverlayManager(private val context: Context) {
             isFocusableInTouchMode = true
         }
 
-        val scrim = View(context).apply {
-            setBackgroundColor(Color.BLACK)
-            alpha = 0f
-            setOnClickListener {
-                if (isFullscreen) {
-                    setFullscreen(false)
-                }
-            }
-        }
-        scrimView = scrim
-        host.addView(
-            scrim,
-            FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.MATCH_PARENT,
-                FrameLayout.LayoutParams.MATCH_PARENT,
-            )
-        )
-
         val card = FrameLayout(context).apply {
             setBackgroundColor(Color.parseColor("#FF10151E"))
             alpha = 0f
             pivotX = 0f
             pivotY = 0f
-            elevation = if (startFullscreen) dp(24).toFloat() else dp(18).toFloat()
+            elevation = if (startFullscreen) dp(28).toFloat() else dp(18).toFloat()
             outlineProvider = object : ViewOutlineProvider() {
                 override fun getOutline(view: View, outline: Outline) {
                     outline.setRoundRect(0, 0, view.width, view.height, currentCornerRadiusPx)
@@ -254,9 +238,8 @@ class OverlayManager(private val context: Context) {
             card.addView(buildSubtleLiveDot(pip.scaleX))
         }
 
-        // Build PiP hover HUD & Fullscreen HUD inside card
-        buildPipHoverHud(card, pip)
-        buildFullscreenHud(card, exp, startFullscreen)
+        // Build Liquid Glass rim + PiP & Fullscreen top-right Liquid Glass orbs
+        buildLiquidGlassHud(card, pip, exp, startFullscreen)
 
         host.addView(card, FrameLayout.LayoutParams(screenW, screenH, Gravity.TOP or Gravity.START))
 
@@ -281,11 +264,8 @@ class OverlayManager(private val context: Context) {
 
         host.requestFocus()
 
-        // Glide card in immediately (<30 ms) so pressing the toggle feels instant!
-        animateCardEntrance(card, scrim, pip, startFullscreen)
+        animateCardEntrance(card, pip, startFullscreen)
 
-        // Start initial auto-dismiss timer (will be refreshed on first video frame so wake latency
-        // never steals viewing time, or cancelled immediately if the user hovers / enters fullscreen)
         scheduleAutoDismiss(
             if (isKeepAlive) KEEP_ALIVE_SAFETY_CAP_MS
             else (cfg.overlayDurationSec * 1000L) + 4_000L
@@ -295,7 +275,6 @@ class OverlayManager(private val context: Context) {
 
     private fun handleOverlayKeyDown(keyCode: Int): Boolean {
         if (!isFullscreen) {
-            // Corner PiP Mode
             if (!isPipHovered) {
                 return when (keyCode) {
                     KeyEvent.KEYCODE_DPAD_UP,
@@ -314,7 +293,6 @@ class OverlayManager(private val context: Context) {
                     else -> false
                 }
             } else {
-                // Hovered on PiP
                 return when (keyCode) {
                     KeyEvent.KEYCODE_DPAD_RIGHT, KeyEvent.KEYCODE_DPAD_UP -> {
                         if (pipFocusTarget == PipFocusTarget.CARD) {
@@ -326,7 +304,6 @@ class OverlayManager(private val context: Context) {
                         if (pipFocusTarget == PipFocusTarget.DISMISS_BTN) {
                             setPipFocusTarget(PipFocusTarget.CARD)
                         } else {
-                            // Un-hover PiP controls back to clean video (stays alive until dismissed)
                             setPipHovered(false)
                         }
                         true
@@ -358,7 +335,6 @@ class OverlayManager(private val context: Context) {
                     true
                 }
                 KeyEvent.KEYCODE_DPAD_UP, KeyEvent.KEYCODE_DPAD_DOWN -> {
-                    // Ensure dock is highlighted
                     updateFullscreenHudStyles(animated = true)
                     true
                 }
@@ -370,7 +346,6 @@ class OverlayManager(private val context: Context) {
                     true
                 }
                 KeyEvent.KEYCODE_BACK, KeyEvent.KEYCODE_ESCAPE -> {
-                    // Return to Picture-in-Picture (which stays alive until dismissed)
                     setFullscreen(false)
                     true
                 }
@@ -382,7 +357,7 @@ class OverlayManager(private val context: Context) {
     private fun engageKeepAlive() {
         if (!isKeepAlive) {
             isKeepAlive = true
-            Log.i(TAG, "Keep-alive engaged (overlay hovered or fullscreen) — auto-dismiss cancelled")
+            Log.i(TAG, "Keep-alive engaged — auto-dismiss cancelled")
             scheduleAutoDismiss(KEEP_ALIVE_SAFETY_CAP_MS)
             onKeepAliveCallback?.invoke()
         }
@@ -418,23 +393,17 @@ class OverlayManager(private val context: Context) {
         }
     }
 
-    /**
-     * Pure 60 fps GPU transform-matrix PiP <-> 88% Rounded Theater Fullscreen morph.
-     */
     fun setFullscreen(expand: Boolean) {
         mainHandler.post {
             val host = hostWindow ?: return@post
             val card = cardView ?: return@post
-            val scrim = scrimView ?: return@post
             val cfg = currentCfg ?: return@post
             if (!isShowing || isHiding || isFullscreen == expand) return@post
 
             isFullscreen = expand
-            // Either entering fullscreen OR returning from fullscreen to PiP keeps stream alive until dismissed!
             engageKeepAlive()
 
             card.animate().cancel()
-            scrim.animate().cancel()
             cornerAnimator?.cancel()
             host.requestFocus()
 
@@ -445,29 +414,36 @@ class OverlayManager(private val context: Context) {
 
             if (expand) {
                 isPipHovered = false
-                updatePipHudStyles(animated = true, visibilityChanged = true)
+                pipCloseOrb?.animate()?.cancel()
+                pipCloseOrb?.animate()
+                    ?.alpha(0f)
+                    ?.scaleX(0.6f)
+                    ?.scaleY(0.6f)
+                    ?.setDuration(150L)
+                    ?.start()
 
                 fsFocusTarget = FullscreenFocusTarget.PIP_BTN
                 updateFullscreenHudStyles(animated = false)
-                fsHudDock?.apply {
+                fsTopRightRow?.apply {
                     visibility = View.VISIBLE
                     animate().cancel()
-                    translationY = expDp(18, exp.scaleX).toFloat()
+                    scaleX = 0.82f
+                    scaleY = 0.82f
                     animate()
                         .alpha(1f)
-                        .translationY(0f)
-                        .setDuration(320L)
-                        .setInterpolator(enterEase)
+                        .scaleX(1f)
+                        .scaleY(1f)
+                        .setDuration(300L)
+                        .setInterpolator(popSpring)
                         .start()
                 }
 
-                card.elevation = dp(24).toFloat()
-                scrim.animate()
-                    .alpha(EXPANDED_SCRIM_ALPHA)
-                    .setDuration(380L)
-                    .setInterpolator(morphEase)
-                    .start()
+                glassRimView?.apply {
+                    setStrokeState(pipDp(1, exp.scaleX).toFloat(), bright = false)
+                    animate().alpha(0.75f).setDuration(260L).start()
+                }
 
+                card.elevation = dp(28).toFloat()
                 animateCornerRadius(card, currentCornerRadiusPx, exp.unscaledCornerRadius, 400L)
 
                 card.animate()
@@ -479,28 +455,23 @@ class OverlayManager(private val context: Context) {
                     .setInterpolator(morphEase)
                     .start()
             } else {
-                // Returning from Fullscreen to PiP mode: stays on until dismissed!
-                fsHudDock?.apply {
+                fsTopRightRow?.apply {
                     animate().cancel()
                     animate()
                         .alpha(0f)
-                        .translationY(expDp(14, exp.scaleX).toFloat())
-                        .setDuration(200L)
+                        .scaleX(0.8f)
+                        .scaleY(0.8f)
+                        .setDuration(180L)
                         .setInterpolator(exitEase)
                         .withEndAction { visibility = View.GONE }
                         .start()
                 }
 
                 isPipHovered = false
-                updatePipHudStyles(animated = false, visibilityChanged = true)
+                pipCloseOrb?.alpha = 0f
+                glassRimView?.animate()?.alpha(0f)?.setDuration(200L)?.start()
 
                 card.elevation = dp(18).toFloat()
-                scrim.animate()
-                    .alpha(0f)
-                    .setDuration(320L)
-                    .setInterpolator(morphEase)
-                    .start()
-
                 animateCornerRadius(card, currentCornerRadiusPx, pip.unscaledCornerRadius, 360L)
 
                 card.animate()
@@ -519,7 +490,6 @@ class OverlayManager(private val context: Context) {
         mainHandler.post {
             val host = hostWindow
             val card = cardView
-            val scrim = scrimView
             val cfg = currentCfg
             if (host == null || card == null || cfg == null || isHiding) {
                 hideImmediate()
@@ -532,10 +502,8 @@ class OverlayManager(private val context: Context) {
             dismissRunnable = null
             card.animate().cancel()
             video?.animate()?.cancel()
-            scrim?.animate()?.cancel()
             cornerAnimator?.cancel()
 
-            scrim?.animate()?.alpha(0f)?.setDuration(240L)?.setInterpolator(exitEase)?.start()
             video?.animate()?.alpha(0f)?.setDuration(240L)?.setInterpolator(exitEase)?.start()
 
             if (isFullscreen) {
@@ -599,22 +567,15 @@ class OverlayManager(private val context: Context) {
 
         val h = hostWindow
         hostWindow = null
-        scrimView = null
         cardView = null
         rootParams = null
         currentCfg = null
         connectingContainer = null
-        pipBorderView = null
-        pipBorderDrawable = null
-        pipCloseBtn = null
-        pipCloseDrawable = null
-        pipExpandPill = null
-        pipExpandDrawable = null
-        fsHudDock = null
-        fsPipBtn = null
-        fsPipDrawable = null
-        fsDismissBtn = null
-        fsDismissDrawable = null
+        glassRimView = null
+        pipCloseOrb = null
+        fsTopRightRow = null
+        fsPipOrb = null
+        fsCloseOrb = null
         isShowing = false
         isFullscreen = false
         isKeepAlive = false
@@ -630,7 +591,6 @@ class OverlayManager(private val context: Context) {
 
     private fun animateCardEntrance(
         card: FrameLayout,
-        scrim: View,
         pip: PipTransform,
         fullscreen: Boolean,
     ) {
@@ -640,9 +600,7 @@ class OverlayManager(private val context: Context) {
             val startScale = exp.scaleX * 0.94f
             val startX = (screenW - screenW * startScale) / 2f
             val startY = (screenH - screenH * startScale) / 2f + dp(16)
-            card.elevation = dp(24).toFloat()
-            scrim.alpha = 0f
-            scrim.animate().alpha(EXPANDED_SCRIM_ALPHA).setDuration(300L).setInterpolator(enterEase).start()
+            card.elevation = dp(28).toFloat()
 
             card.pivotX = 0f
             card.pivotY = 0f
@@ -703,7 +661,6 @@ class OverlayManager(private val context: Context) {
             .setInterpolator(enterEase)
             .start()
 
-        // Reset the 20-second auto-dismiss timer from the moment video actually appears
         if (!isKeepAlive) {
             scheduleAutoDismiss(cfg.overlayDurationSec * 1000L)
         }
@@ -713,8 +670,8 @@ class OverlayManager(private val context: Context) {
         val pillDrawable = GradientDrawable().apply {
             shape = GradientDrawable.RECTANGLE
             cornerRadius = expDp(999, activeScale).toFloat()
-            setColor(Color.parseColor("#B318202C"))
-            setStroke(expDp(1, activeScale), Color.parseColor("#33FFFFFF"))
+            setColor(Color.parseColor("#88161E2B"))
+            setStroke(expDp(1, activeScale), Color.parseColor("#44FFFFFF"))
         }
         val row = LinearLayout(context).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -746,7 +703,7 @@ class OverlayManager(private val context: Context) {
         }
         val label = TextView(context).apply {
             text = "Connecting…"
-            setTextColor(Color.parseColor("#D9FFFFFF"))
+            setTextColor(Color.parseColor("#E6FFFFFF"))
             setTextSize(TypedValue.COMPLEX_UNIT_PX, expDp(13, activeScale).toFloat())
             typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
         }
@@ -755,49 +712,47 @@ class OverlayManager(private val context: Context) {
         return row
     }
 
-    private fun buildPipHoverHud(card: FrameLayout, pip: PipTransform) {
-        val s = pip.scaleX.coerceAtLeast(0.15f)
+    private fun buildLiquidGlassHud(
+        card: FrameLayout,
+        pip: PipTransform,
+        exp: PipTransform,
+        startFullscreen: Boolean,
+    ) {
+        val pipS = pip.scaleX.coerceAtLeast(0.15f)
+        val expS = exp.scaleX.coerceAtLeast(0.5f)
 
-        // 1. Rounded hover border around the PiP card
-        val borderDraw = GradientDrawable().apply {
-            shape = GradientDrawable.RECTANGLE
-            cornerRadius = pip.unscaledCornerRadius
-            setColor(Color.TRANSPARENT)
-            setStroke(pipDp(2, s), Color.parseColor("#E6FFFFFF"))
-        }
-        pipBorderDrawable = borderDraw
-        val borderView = View(context).apply {
-            background = borderDraw
-            alpha = 0f
+        // 1. Directional Liquid Glass Specular Rim around card
+        val rim = LiquidGlassRimView(context).apply {
+            setStrokeState(
+                strokeWidthPx = if (startFullscreen) expDp(1, expS).toFloat() else pipDp(2, pipS).toFloat(),
+                bright = false,
+            )
+            alpha = if (startFullscreen) 0.75f else 0f
             layoutParams = FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT,
                 FrameLayout.LayoutParams.MATCH_PARENT,
             )
         }
-        pipBorderView = borderView
-        card.addView(borderView)
+        glassRimView = rim
+        card.addView(rim)
 
-        // 2. Sleek top-right circular `✕` dismiss button (animates in on PiP hover)
-        val closeDraw = GradientDrawable().apply {
-            shape = GradientDrawable.OVAL
-            setColor(Color.parseColor("#D90F141C"))
-            setStroke(pipDp(1, s), Color.parseColor("#77FFFFFF"))
-        }
-        pipCloseDrawable = closeDraw
-        val closeSize = pipDp(34, s)
-        val closeMargin = pipDp(12, s)
-        val closeBtn = TextView(context).apply {
-            text = "✕"
-            gravity = Gravity.CENTER
-            setTextColor(Color.WHITE)
-            setTextSize(TypedValue.COMPLEX_UNIT_PX, pipDp(15, s).toFloat())
-            typeface = Typeface.create("sans-serif-medium", Typeface.BOLD)
-            background = closeDraw
+        // 2. Corner PiP Top-Right Liquid Glass `✕` Orb (no bottom-left fullscreen button!)
+        val pipOrbSize = pipDp(36, pipS)
+        val pipOrbMargin = pipDp(12, pipS)
+        val closeOrb = LiquidGlassOrbButton(
+            context = context,
+            iconType = GlassIconType.CLOSE_X,
+            strokeScalePx = pipDp(1, pipS).toFloat(),
+        ).apply {
             alpha = 0f
-            scaleX = 0.65f
-            scaleY = 0.65f
-            layoutParams = FrameLayout.LayoutParams(closeSize, closeSize, Gravity.TOP or Gravity.END).apply {
-                setMargins(0, closeMargin, closeMargin, 0)
+            scaleX = 0.6f
+            scaleY = 0.6f
+            layoutParams = FrameLayout.LayoutParams(
+                pipOrbSize,
+                pipOrbSize,
+                Gravity.TOP or Gravity.END,
+            ).apply {
+                setMargins(0, pipOrbMargin, pipOrbMargin, 0)
             }
             setOnHoverListener { _, ev ->
                 if (!isFullscreen && !isHiding && ev.actionMasked == MotionEvent.ACTION_HOVER_ENTER) {
@@ -811,182 +766,40 @@ class OverlayManager(private val context: Context) {
                 }
             }
         }
-        pipCloseBtn = closeBtn
-        card.addView(closeBtn)
+        pipCloseOrb = closeOrb
+        card.addView(closeOrb)
 
-        // 3. Sleek bottom-left `⤢ Fullscreen` pill (indicates clicking the hovered PiP opens Fullscreen)
-        val expandDraw = GradientDrawable().apply {
-            shape = GradientDrawable.RECTANGLE
-            cornerRadius = pipDp(999, s).toFloat()
-            setColor(Color.parseColor("#F0FFFFFF"))
-        }
-        pipExpandDrawable = expandDraw
-        val expandPill = TextView(context).apply {
-            text = "⤢  Fullscreen"
-            gravity = Gravity.CENTER
-            setTextColor(Color.parseColor("#FF0F141C"))
-            setTextSize(TypedValue.COMPLEX_UNIT_PX, pipDp(12, s).toFloat())
-            typeface = Typeface.create("sans-serif-medium", Typeface.BOLD)
-            background = expandDraw
-            val padH = pipDp(12, s)
-            val padV = pipDp(6, s)
-            setPadding(padH, padV, padH, padV)
-            alpha = 0f
-            scaleX = 0.85f
-            scaleY = 0.85f
-            layoutParams = FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.WRAP_CONTENT,
-                FrameLayout.LayoutParams.WRAP_CONTENT,
-                Gravity.BOTTOM or Gravity.START,
-            ).apply {
-                setMargins(closeMargin, 0, 0, closeMargin)
-            }
-            setOnClickListener {
-                if (!isHiding && !isFullscreen) {
-                    setFullscreen(true)
-                }
-            }
-        }
-        pipExpandPill = expandPill
-        card.addView(expandPill)
-    }
+        // 3. Fullscreen Top-Right Liquid Glass Icon Orbs (`PiP Minimize` + `✕ Close`)
+        val fsRowMargin = expDp(18, expS)
+        val fsOrbSize = expDp(42, expS)
+        val fsOrbGap = expDp(12, expS)
 
-    private fun updatePipHudStyles(animated: Boolean, visibilityChanged: Boolean) {
-        val cfg = currentCfg ?: return
-        val pip = computePipTransform(cfg)
-        val s = pip.scaleX.coerceAtLeast(0.15f)
-        val borderView = pipBorderView ?: return
-        val closeBtn = pipCloseBtn ?: return
-        val expandPill = pipExpandPill ?: return
-
-        if (!isPipHovered || isFullscreen) {
-            borderView.animate().cancel()
-            closeBtn.animate().cancel()
-            expandPill.animate().cancel()
-            if (animated) {
-                borderView.animate().alpha(0f).setDuration(160L).start()
-                closeBtn.animate()
-                    .alpha(0f)
-                    .scaleX(0.68f)
-                    .scaleY(0.68f)
-                    .setDuration(170L)
-                    .setInterpolator(exitEase)
-                    .start()
-                expandPill.animate()
-                    .alpha(0f)
-                    .scaleX(0.85f)
-                    .scaleY(0.85f)
-                    .setDuration(160L)
-                    .setInterpolator(exitEase)
-                    .start()
-            } else {
-                borderView.alpha = 0f
-                closeBtn.alpha = 0f
-                closeBtn.scaleX = 0.68f
-                closeBtn.scaleY = 0.68f
-                expandPill.alpha = 0f
-                expandPill.scaleX = 0.85f
-                expandPill.scaleY = 0.85f
-            }
-            return
-        }
-
-        val onDismiss = pipFocusTarget == PipFocusTarget.DISMISS_BTN
-
-        // Update border & button fills
-        pipBorderDrawable?.setStroke(
-            pipDp(2, s),
-            if (onDismiss) Color.parseColor("#66FFFFFF") else Color.parseColor("#E6FFFFFF")
-        )
-        pipCloseDrawable?.apply {
-            setColor(if (onDismiss) Color.parseColor("#FFFF453A") else Color.parseColor("#D90F141C"))
-            setStroke(
-                pipDp(if (onDismiss) 2 else 1, s),
-                if (onDismiss) Color.WHITE else Color.parseColor("#80FFFFFF")
-            )
-        }
-        pipExpandDrawable?.apply {
-            setColor(if (!onDismiss) Color.parseColor("#F2FFFFFF") else Color.parseColor("#BF0F141C"))
-            setStroke(
-                pipDp(1, s),
-                if (!onDismiss) Color.WHITE else Color.parseColor("#44FFFFFF")
-            )
-        }
-        expandPill.setTextColor(
-            if (!onDismiss) Color.parseColor("#FF0F141C") else Color.parseColor("#CCFFFFFF")
-        )
-
-        val closeTargetScale = if (onDismiss) 1.14f else 1.0f
-        val expandTargetScale = if (!onDismiss) 1.0f else 0.94f
-
-        borderView.animate().cancel()
-        closeBtn.animate().cancel()
-        expandPill.animate().cancel()
-
-        borderView.animate().alpha(1f).setDuration(180L).start()
-        closeBtn.animate()
-            .alpha(1f)
-            .scaleX(closeTargetScale)
-            .scaleY(closeTargetScale)
-            .setDuration(if (visibilityChanged) 230L else 160L)
-            .setInterpolator(popSpring)
-            .start()
-        expandPill.animate()
-            .alpha(1f)
-            .scaleX(expandTargetScale)
-            .scaleY(expandTargetScale)
-            .setDuration(200L)
-            .setInterpolator(enterEase)
-            .start()
-    }
-
-    private fun buildFullscreenHud(card: FrameLayout, exp: PipTransform, startFullscreen: Boolean) {
-        val s = exp.scaleX.coerceAtLeast(0.5f)
-
-        val dockDrawable = GradientDrawable().apply {
-            shape = GradientDrawable.RECTANGLE
-            cornerRadius = expDp(999, s).toFloat()
-            setColor(Color.parseColor("#D90D121A"))
-            setStroke(expDp(1, s), Color.parseColor("#38FFFFFF"))
-        }
-
-        val dock = LinearLayout(context).apply {
+        val topRightRow = LinearLayout(context).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            background = dockDrawable
-            val pad = expDp(6, s)
+            clipChildren = false
+            clipToPadding = false
+            val pad = expDp(6, expS)
             setPadding(pad, pad, pad, pad)
             alpha = if (startFullscreen) 1f else 0f
             visibility = if (startFullscreen) View.VISIBLE else View.GONE
             layoutParams = FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.WRAP_CONTENT,
                 FrameLayout.LayoutParams.WRAP_CONTENT,
-                Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL,
+                Gravity.TOP or Gravity.END,
             ).apply {
-                bottomMargin = expDp(28, s)
+                setMargins(0, fsRowMargin, fsRowMargin, 0)
             }
         }
-        fsHudDock = dock
+        fsTopRightRow = topRightRow
 
-        val pipDraw = GradientDrawable().apply {
-            shape = GradientDrawable.RECTANGLE
-            cornerRadius = expDp(999, s).toFloat()
-        }
-        fsPipDrawable = pipDraw
-        val pipBtn = TextView(context).apply {
-            text = "↙   Picture in Picture"
-            gravity = Gravity.CENTER
-            setTextSize(TypedValue.COMPLEX_UNIT_PX, expDp(15, s).toFloat())
-            typeface = Typeface.create("sans-serif-medium", Typeface.BOLD)
-            background = pipDraw
-            val padH = expDp(20, s)
-            val padV = expDp(10, s)
-            setPadding(padH, padV, padH, padV)
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT,
-            ).apply {
-                rightMargin = expDp(6, s)
+        val pipMinOrb = LiquidGlassOrbButton(
+            context = context,
+            iconType = GlassIconType.PIP_MINIMIZE,
+            strokeScalePx = expDp(1, expS).toFloat(),
+        ).apply {
+            layoutParams = LinearLayout.LayoutParams(fsOrbSize, fsOrbSize).apply {
+                rightMargin = fsOrbGap
             }
             setOnHoverListener { _, ev ->
                 if (isFullscreen && ev.actionMasked == MotionEvent.ACTION_HOVER_ENTER) {
@@ -1000,26 +813,14 @@ class OverlayManager(private val context: Context) {
                 }
             }
         }
-        fsPipBtn = pipBtn
+        fsPipOrb = pipMinOrb
 
-        val dismissDraw = GradientDrawable().apply {
-            shape = GradientDrawable.RECTANGLE
-            cornerRadius = expDp(999, s).toFloat()
-        }
-        fsDismissDrawable = dismissDraw
-        val dismissBtn = TextView(context).apply {
-            text = "✕   Dismiss"
-            gravity = Gravity.CENTER
-            setTextSize(TypedValue.COMPLEX_UNIT_PX, expDp(15, s).toFloat())
-            typeface = Typeface.create("sans-serif-medium", Typeface.BOLD)
-            background = dismissDraw
-            val padH = expDp(20, s)
-            val padV = expDp(10, s)
-            setPadding(padH, padV, padH, padV)
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT,
-            )
+        val fsDismissOrb = LiquidGlassOrbButton(
+            context = context,
+            iconType = GlassIconType.CLOSE_X,
+            strokeScalePx = expDp(1, expS).toFloat(),
+        ).apply {
+            layoutParams = LinearLayout.LayoutParams(fsOrbSize, fsOrbSize)
             setOnHoverListener { _, ev ->
                 if (isFullscreen && ev.actionMasked == MotionEvent.ACTION_HOVER_ENTER) {
                     setFullscreenFocusTarget(FullscreenFocusTarget.DISMISS_BTN)
@@ -1032,50 +833,333 @@ class OverlayManager(private val context: Context) {
                 }
             }
         }
-        fsDismissBtn = dismissBtn
+        fsCloseOrb = fsDismissOrb
 
-        dock.addView(pipBtn)
-        dock.addView(dismissBtn)
-        card.addView(dock)
+        topRightRow.addView(pipMinOrb)
+        topRightRow.addView(fsDismissOrb)
+        card.addView(topRightRow)
 
         updateFullscreenHudStyles(animated = false)
     }
 
+    private fun updatePipHudStyles(animated: Boolean, visibilityChanged: Boolean) {
+        val cfg = currentCfg ?: return
+        val card = cardView ?: return
+        val pip = computePipTransform(cfg)
+        val pipS = pip.scaleX.coerceAtLeast(0.15f)
+        val rim = glassRimView ?: return
+        val closeOrb = pipCloseOrb ?: return
+
+        if (!isPipHovered || isFullscreen) {
+            rim.animate().cancel()
+            closeOrb.animate().cancel()
+            if (animated) {
+                rim.animate().alpha(0f).setDuration(160L).start()
+                closeOrb.animate()
+                    .alpha(0f)
+                    .scaleX(0.6f)
+                    .scaleY(0.6f)
+                    .setDuration(170L)
+                    .setInterpolator(exitEase)
+                    .start()
+                if (!isFullscreen) {
+                    card.animate()
+                        .scaleX(pip.scaleX)
+                        .scaleY(pip.scaleY)
+                        .translationX(pip.x)
+                        .translationY(pip.y)
+                        .setDuration(200L)
+                        .setInterpolator(morphEase)
+                        .start()
+                }
+            } else {
+                rim.alpha = 0f
+                closeOrb.alpha = 0f
+                closeOrb.scaleX = 0.6f
+                closeOrb.scaleY = 0.6f
+            }
+            return
+        }
+
+        val onDismiss = pipFocusTarget == PipFocusTarget.DISMISS_BTN
+        closeOrb.setFocusedState(onDismiss)
+
+        // When hovering the PiP card itself (CARD target), gently swell the PiP card by 3.6%
+        // with a bright Liquid Glass specular rim so it clearly feels clickable for Fullscreen!
+        val cardHoverFactor = if (!onDismiss) 1.036f else 1.0f
+        val targetScaleX = pip.scaleX * cardHoverFactor
+        val targetScaleY = pip.scaleY * cardHoverFactor
+        val targetX = pip.x - (cfg.overlayWidthPx * (cardHoverFactor - 1f) * 0.5f)
+        val targetY = pip.y - (cfg.overlayHeightPx * (cardHoverFactor - 1f) * 0.5f)
+
+        rim.setStrokeState(pipDp(2, pipS).toFloat(), bright = !onDismiss)
+        rim.animate().cancel()
+        rim.animate().alpha(if (!onDismiss) 1f else 0.55f).setDuration(180L).start()
+
+        card.animate().cancel()
+        card.animate()
+            .scaleX(targetScaleX)
+            .scaleY(targetScaleY)
+            .translationX(targetX)
+            .translationY(targetY)
+            .setDuration(220L)
+            .setInterpolator(popSpring)
+            .start()
+
+        val orbScale = if (onDismiss) 1.16f else 1.0f
+        closeOrb.animate().cancel()
+        closeOrb.animate()
+            .alpha(1f)
+            .scaleX(orbScale)
+            .scaleY(orbScale)
+            .setDuration(if (visibilityChanged) 240L else 170L)
+            .setInterpolator(popSpring)
+            .start()
+    }
+
     private fun updateFullscreenHudStyles(animated: Boolean) {
-        val pipBtn = fsPipBtn ?: return
-        val dismissBtn = fsDismissBtn ?: return
+        val pipOrb = fsPipOrb ?: return
+        val closeOrb = fsCloseOrb ?: return
         val onPip = fsFocusTarget == FullscreenFocusTarget.PIP_BTN
 
-        fsPipDrawable?.setColor(
-            if (onPip) Color.parseColor("#F2FFFFFF") else Color.TRANSPARENT
-        )
-        pipBtn.setTextColor(
-            if (onPip) Color.parseColor("#FF0D121A") else Color.parseColor("#B3FFFFFF")
-        )
+        pipOrb.setFocusedState(onPip)
+        closeOrb.setFocusedState(!onPip)
 
-        fsDismissDrawable?.setColor(
-            if (!onPip) Color.parseColor("#FFFF453A") else Color.TRANSPARENT
-        )
-        dismissBtn.setTextColor(
-            if (!onPip) Color.WHITE else Color.parseColor("#B3FFFFFF")
-        )
+        val pipScale = if (onPip) 1.15f else 0.96f
+        val closeScale = if (!onPip) 1.15f else 0.96f
 
         if (animated) {
-            pipBtn.animate()
-                .scaleX(if (onPip) 1.03f else 0.97f)
-                .scaleY(if (onPip) 1.03f else 0.97f)
-                .setDuration(150L)
+            pipOrb.animate()
+                .scaleX(pipScale)
+                .scaleY(pipScale)
+                .setDuration(180L)
+                .setInterpolator(popSpring)
                 .start()
-            dismissBtn.animate()
-                .scaleX(if (!onPip) 1.03f else 0.97f)
-                .scaleY(if (!onPip) 1.03f else 0.97f)
-                .setDuration(150L)
+            closeOrb.animate()
+                .scaleX(closeScale)
+                .scaleY(closeScale)
+                .setDuration(180L)
+                .setInterpolator(popSpring)
                 .start()
         } else {
-            pipBtn.scaleX = if (onPip) 1.03f else 0.97f
-            pipBtn.scaleY = if (onPip) 1.03f else 0.97f
-            dismissBtn.scaleX = if (!onPip) 1.03f else 0.97f
-            dismissBtn.scaleY = if (!onPip) 1.03f else 0.97f
+            pipOrb.scaleX = pipScale
+            pipOrb.scaleY = pipScale
+            closeOrb.scaleX = closeScale
+            closeOrb.scaleY = closeScale
+        }
+    }
+
+    /**
+     * Directional Liquid Glass specular rim border around the rounded video card.
+     */
+    private inner class LiquidGlassRimView(context: Context) : View(context) {
+        private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE
+        }
+        private val rect = RectF()
+        private var strokeW = 4f
+        private var isBright = true
+
+        fun setStrokeState(strokeWidthPx: Float, bright: Boolean) {
+            strokeW = strokeWidthPx
+            isBright = bright
+            paint.strokeWidth = strokeWidthPx
+            updateGradient(width, height)
+            invalidate()
+        }
+
+        override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
+            super.onSizeChanged(w, h, oldw, oldh)
+            updateGradient(w, h)
+        }
+
+        private fun updateGradient(w: Int, h: Int) {
+            if (w <= 0 || h <= 0) return
+            val colors = if (isBright) {
+                intArrayOf(
+                    Color.parseColor("#F5FFFFFF"),
+                    Color.parseColor("#66D8ECFF"),
+                    Color.parseColor("#33FFFFFF"),
+                    Color.parseColor("#B3FFFFFF"),
+                )
+            } else {
+                intArrayOf(
+                    Color.parseColor("#88FFFFFF"),
+                    Color.parseColor("#28FFFFFF"),
+                    Color.parseColor("#18FFFFFF"),
+                    Color.parseColor("#55FFFFFF"),
+                )
+            }
+            paint.shader = LinearGradient(
+                0f, 0f, w.toFloat(), h.toFloat(),
+                colors,
+                floatArrayOf(0f, 0.38f, 0.72f, 1f),
+                Shader.TileMode.CLAMP,
+            )
+        }
+
+        override fun onDraw(canvas: Canvas) {
+            val half = strokeW * 0.5f
+            rect.set(half, half, width - half, height - half)
+            canvas.drawRoundRect(rect, currentCornerRadiusPx, currentCornerRadiusPx, paint)
+        }
+    }
+
+    /**
+     * Custom-rendered Apple visionOS / iOS Liquid Glass circular orb button with:
+     *  - Translucent diagonal glass body gradient
+     *  - Top-left internal caustic lens refraction radial highlight
+     *  - Dual-angle directional specular rim stroke
+     *  - Crisp anti-aliased vector iconography (no font text glyphs)
+     */
+    private inner class LiquidGlassOrbButton(
+        context: Context,
+        private val iconType: GlassIconType,
+        private val strokeScalePx: Float,
+    ) : View(context) {
+
+        private var isFocusedOrb = false
+        private val bodyPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
+        private val lensPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
+        private val rimPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE }
+        private val iconPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE
+            strokeCap = Paint.Cap.ROUND
+            strokeJoin = Paint.Join.ROUND
+            color = Color.WHITE
+        }
+        private val iconFillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.FILL
+            color = Color.WHITE
+        }
+        private val rect = RectF()
+
+        fun setFocusedState(focused: Boolean) {
+            if (isFocusedOrb == focused) return
+            isFocusedOrb = focused
+            rebuildShaders(width, height)
+            invalidate()
+        }
+
+        override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
+            super.onSizeChanged(w, h, oldw, oldh)
+            rebuildShaders(w, h)
+        }
+
+        private fun rebuildShaders(w: Int, h: Int) {
+            if (w <= 0 || h <= 0) return
+            val wf = w.toFloat()
+            val hf = h.toFloat()
+
+            // 1. Translucent Liquid Glass body fill
+            val bodyColors = if (isFocusedOrb) {
+                intArrayOf(
+                    Color.parseColor("#9434465E"),
+                    Color.parseColor("#801C2636"),
+                    Color.parseColor("#8C2A384D"),
+                )
+            } else {
+                intArrayOf(
+                    Color.parseColor("#6E161E2B"),
+                    Color.parseColor("#5C0D121A"),
+                    Color.parseColor("#66131A26"),
+                )
+            }
+            bodyPaint.shader = LinearGradient(
+                0f, 0f, wf, hf,
+                bodyColors,
+                floatArrayOf(0f, 0.55f, 1f),
+                Shader.TileMode.CLAMP,
+            )
+
+            // 2. Top-left internal specular lens caustic refraction
+            val causticTopAlpha = if (isFocusedOrb) "#60FFFFFF" else "#2EFFFFFF"
+            val causticMidAlpha = if (isFocusedOrb) "#1EFFFFFF" else "#0CFFFFFF"
+            lensPaint.shader = RadialGradient(
+                wf * 0.30f,
+                hf * 0.24f,
+                wf * 0.68f,
+                intArrayOf(
+                    Color.parseColor(causticTopAlpha),
+                    Color.parseColor(causticMidAlpha),
+                    Color.TRANSPARENT,
+                ),
+                floatArrayOf(0f, 0.52f, 1f),
+                Shader.TileMode.CLAMP,
+            )
+
+            // 3. Directional specular glass rim
+            rimPaint.strokeWidth = strokeScalePx * (if (isFocusedOrb) 1.85f else 1.25f)
+            val rimColors = if (isFocusedOrb) {
+                intArrayOf(
+                    Color.parseColor("#FFFFFFFF"),
+                    Color.parseColor("#70D6ECFF"),
+                    Color.parseColor("#38FFFFFF"),
+                    Color.parseColor("#D9FFFFFF"),
+                )
+            } else {
+                intArrayOf(
+                    Color.parseColor("#99FFFFFF"),
+                    Color.parseColor("#33FFFFFF"),
+                    Color.parseColor("#1EFFFFFF"),
+                    Color.parseColor("#66FFFFFF"),
+                )
+            }
+            rimPaint.shader = LinearGradient(
+                0f, 0f, wf, hf,
+                rimColors,
+                floatArrayOf(0f, 0.4f, 0.7f, 1f),
+                Shader.TileMode.CLAMP,
+            )
+
+            iconPaint.color = if (isFocusedOrb) Color.WHITE else Color.parseColor("#D9FFFFFF")
+            iconFillPaint.color = iconPaint.color
+        }
+
+        override fun onDraw(canvas: Canvas) {
+            val wf = width.toFloat()
+            val hf = height.toFloat()
+            if (wf <= 0f || hf <= 0f) return
+
+            val cx = wf * 0.5f
+            val cy = hf * 0.5f
+            val radius = minOf(wf, hf) * 0.5f - rimPaint.strokeWidth * 0.6f
+
+            // Draw glass body, caustic refraction lens, and specular rim
+            canvas.drawCircle(cx, cy, radius, bodyPaint)
+            canvas.drawCircle(cx, cy, radius, lensPaint)
+            canvas.drawCircle(cx, cy, radius, rimPaint)
+
+            when (iconType) {
+                GlassIconType.CLOSE_X -> {
+                    iconPaint.strokeWidth = strokeScalePx * 1.95f
+                    val d = radius * 0.34f
+                    canvas.drawLine(cx - d, cy - d, cx + d, cy + d, iconPaint)
+                    canvas.drawLine(cx + d, cy - d, cx - d, cy + d, iconPaint)
+                }
+                GlassIconType.PIP_MINIMIZE -> {
+                    // Crisp vector Picture-in-Picture icon: rounded outer frame + filled top-right mini PiP window
+                    iconPaint.strokeWidth = strokeScalePx * 1.65f
+                    val ow = radius * 0.88f
+                    val oh = radius * 0.66f
+                    val cr = strokeScalePx * 2.2f
+                    rect.set(cx - ow * 0.5f, cy - oh * 0.5f, cx + ow * 0.5f, cy + oh * 0.5f)
+                    canvas.drawRoundRect(rect, cr, cr, iconPaint)
+
+                    // Filled mini PiP window in top-right quadrant of the frame
+                    val pw = ow * 0.42f
+                    val ph = oh * 0.42f
+                    val inset = strokeScalePx * 2.1f
+                    rect.set(
+                        cx + ow * 0.5f - inset - pw,
+                        cy - oh * 0.5f + inset,
+                        cx + ow * 0.5f - inset,
+                        cy - oh * 0.5f + inset + ph,
+                    )
+                    val pcr = strokeScalePx * 1.2f
+                    canvas.drawRoundRect(rect, pcr, pcr, iconFillPaint)
+                }
+            }
         }
     }
 
@@ -1087,6 +1171,7 @@ class OverlayManager(private val context: Context) {
             addUpdateListener { anim ->
                 currentCornerRadiusPx = anim.animatedValue as Float
                 card.invalidateOutline()
+                glassRimView?.invalidate()
             }
             start()
         }
@@ -1199,7 +1284,6 @@ class OverlayManager(private val context: Context) {
         private const val PIP_VISUAL_CORNER_RADIUS_PX = 20f
         private const val EXPANDED_VISUAL_CORNER_RADIUS_PX = 28f
         private const val EXPANDED_SCREEN_FRACTION = 0.88f
-        private const val EXPANDED_SCRIM_ALPHA = 0.76f
         private const val PIP_MARGIN_DP = 24
         private const val KEEP_ALIVE_SAFETY_CAP_MS = 5 * 60 * 1000L
     }
