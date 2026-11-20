@@ -75,7 +75,7 @@ class RelayClient(
                         RelayRingEvent(
                             eventId = ev.optString("event_id", "unknown"),
                             eventType = ev.optString("event_type", "unknown"),
-                            deviceId = ev.optString("device_id", "").takeIf { it.isNotBlank() },
+                            deviceId = if (ev.isNull("device_id")) null else ev.optString("device_id", "").takeIf { it.isNotBlank() && it != "null" },
                             ringEventTsMs = if (ev.isNull("ring_event_ts_ms")) null else ev.optLong("ring_event_ts_ms"),
                             relayRxTsMs = if (ev.isNull("relay_rx_ts_ms")) null else ev.optLong("relay_rx_ts_ms"),
                             synthetic = ev.optBoolean("synthetic", false),
@@ -117,8 +117,8 @@ class RelayClient(
             val json = JSONObject(bodyStr)
             WhepResponse(
                 sdpAnswer = json.getString("sdpAnswer"),
-                sessionUrl = json.optString("sessionUrl", "").takeIf { it.isNotBlank() },
-                ringRttMs = if (json.has("ringRttMs")) json.optDouble("ringRttMs") else null,
+                sessionUrl = if (json.isNull("sessionUrl")) null else json.optString("sessionUrl", "").takeIf { it.isNotBlank() && it != "null" },
+                ringRttMs = if (json.has("ringRttMs") && !json.isNull("ringRttMs")) json.optDouble("ringRttMs") else null,
             )
         }
     }

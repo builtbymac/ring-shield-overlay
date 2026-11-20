@@ -145,7 +145,8 @@ async function main(): Promise<void> {
           sdpOffer?: string
           deviceId?: string
         }
-        const resolvedId = deviceId || cfg.defaultDeviceId
+        const cleanedId = deviceId && deviceId !== 'null' ? deviceId : undefined
+        const resolvedId = cleanedId || cfg.defaultDeviceId
         if (!sdpOffer || !resolvedId) {
           sendJson(res, 400, { error: 'Both sdpOffer and deviceId (or RING_DEVICE_ID) are required' })
           return

@@ -82,6 +82,8 @@ class WebRtcEngine(
         val videoTrackDeferred = CompletableDeferred<VideoTrack>()
         val iceConnectedDeferred = CompletableDeferred<Long>()
         val srflxOrComplete = CompletableDeferred<Unit>()
+        val expectedSrflx = if (cfg.includeAudioTransceiver) 2 else 1
+        val srflxCount = java.util.concurrent.atomic.AtomicInteger(0)
 
         val iceServers = listOf(
             PeerConnection.IceServer.builder("stun:stun.l.google.com:19302").createIceServer(),
@@ -100,6 +102,11 @@ class WebRtcEngine(
             object : PeerConnection.Observer {
                 override fun onIceCandidate(candidate: IceCandidate) {
                     Log.d(TAG, "Gathered ICE candidate: ${candidate.sdp}")
+                    if (candidate.sdp.contains(" typ srflx ")) {
+                        if (srflxCount.incrementAndGet() >= expectedSrflx) {
+                            srflxOrComplete.complete(Unit)
+                        }
+                    }
                 }
 
                 override fun onIceGatheringChange(state: PeerConnection.IceGatheringState) {
