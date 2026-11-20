@@ -1,6 +1,7 @@
 package com.builtbymac.ringshield
 
 import android.content.Context
+import android.media.AudioAttributes
 import android.os.SystemClock
 import android.util.Log
 import kotlinx.coroutines.CompletableDeferred
@@ -29,14 +30,16 @@ data class PrewarmedOffer(
     val sdpOffer: String,
     val createdAtMonoMs: Long,
     val videoTrackDeferred: CompletableDeferred<VideoTrack>,
+    val audioTrackDeferred: CompletableDeferred<AudioTrack>,
     val iceConnectedDeferred: CompletableDeferred<Long>,
 )
 
 /**
  * Manages a single shared EglBase + PeerConnectionFactory and fast WHEP PeerConnections.
  *
- * Audio playout is explicitly disabled/muted so the overlay never interrupts foreground
- * media playback on the Nvidia Shield Pro.
+ * Audio playout starts muted and uses USAGE_ASSISTANCE_ACCESSIBILITY (STREAM_ACCESSIBILITY),
+ * which routes to HDMI at full volume and is exempt from STREAM_MUSIC mute so Live TV
+ * can be muted in the background while Doorbell audio plays clearly.
  */
 class WebRtcEngine(
     private val context: Context,
@@ -47,6 +50,12 @@ class WebRtcEngine(
     private val audioDeviceModule = JavaAudioDeviceModule.builder(context)
         .setUseHardwareAcousticEchoCanceler(false)
         .setUseHardwareNoiseSuppressor(false)
+        .setAudioAttributes(
+            AudioAttributes.Builder()
+                .setUsage(AudioAttributes.USAGE_ASSISTANCE_ACCESSIBILITY)
+                .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                .build()
+        )
         .createAudioDeviceModule()
         .apply {
             setSpeakerMute(true)
@@ -89,6 +98,7 @@ class WebRtcEngine(
      */
     suspend fun prepareOffer(cfg: PocConfig): PrewarmedOffer {
         val videoTrackDeferred = CompletableDeferred<VideoTrack>()
+        val audioTrackDeferred = CompletableDeferred<AudioTrack>()
         val iceConnectedDeferred = CompletableDeferred<Long>()
         val srflxOrComplete = CompletableDeferred<Unit>()
         val expectedSrflx = if (cfg.includeAudioTransceiver) 2 else 1
@@ -101,7 +111,6 @@ class WebRtcEngine(
         )
         val rtcConfig = PeerConnection.RTCConfiguration(iceServers).apply {
             sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN
-            // Match Amazon's official ring-api-helloworld (BALANCED, not MAXBUNDLE)
             bundlePolicy = PeerConnection.BundlePolicy.BALANCED
             continualGatheringPolicy = PeerConnection.ContinualGatheringPolicy.GATHER_ONCE
         }
@@ -143,8 +152,9 @@ class WebRtcEngine(
                             videoTrackDeferred.complete(track)
                         }
                         is AudioTrack -> {
-                            // Never render audio to avoid interrupting YouTube / streaming playback
+                            // Keep muted by default until user clicks the Liquid Glass Audio orb
                             track.setEnabled(false)
+                            audioTrackDeferred.complete(track)
                         }
                     }
                 }
@@ -160,17 +170,17 @@ class WebRtcEngine(
             }
         ) ?: error("PeerConnectionFactory.createPeerConnection returned null")
 
-        if (cfg.includeAudioTransceiver) {
-            // Match official ring-api-helloworld: audio sendrecv (mic & speaker muted at ADM)
-            pc.addTransceiver(
-                MediaStreamTrack.MediaType.MEDIA_TYPE_AUDIO,
-                RtpTransceiver.RtpTransceiverInit(RtpTransceiver.RtpTransceiverDirection.SEND_RECV)
-            )
-        }
         pc.addTransceiver(
             MediaStreamTrack.MediaType.MEDIA_TYPE_VIDEO,
             RtpTransceiver.RtpTransceiverInit(RtpTransceiver.RtpTransceiverDirection.RECV_ONLY)
         )
+        if (cfg.includeAudioTransceiver) {
+            // Ring WHEP requires recvonly on all media tracks (m=video and m=audio)
+            pc.addTransceiver(
+                MediaStreamTrack.MediaType.MEDIA_TYPE_AUDIO,
+                RtpTransceiver.RtpTransceiverInit(RtpTransceiver.RtpTransceiverDirection.RECV_ONLY)
+            )
+        }
 
         val offer = createOfferSuspend(pc)
         setLocalDescriptionSuspend(pc, offer)
@@ -188,6 +198,7 @@ class WebRtcEngine(
             sdpOffer = finalSdp,
             createdAtMonoMs = SystemClock.elapsedRealtime(),
             videoTrackDeferred = videoTrackDeferred,
+            audioTrackDeferred = audioTrackDeferred,
             iceConnectedDeferred = iceConnectedDeferred,
         )
     }
@@ -202,6 +213,12 @@ class WebRtcEngine(
 
     fun attachVideoSink(track: VideoTrack, sink: VideoSink) {
         track.addSink(sink)
+    }
+
+    fun setDoorbellAudioEnabled(track: AudioTrack?, enabled: Boolean) {
+        runCatching { track?.setEnabled(enabled) }
+        runCatching { audioDeviceModule.setSpeakerMute(!enabled) }
+        Log.i(TAG, "Doorbell WebRTC audio playout -> ${if (enabled) "ENABLED" else "MUTED"}")
     }
 
     fun closeOffer(offer: PrewarmedOffer?) {

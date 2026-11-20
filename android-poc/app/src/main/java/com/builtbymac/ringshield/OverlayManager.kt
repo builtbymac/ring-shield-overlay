@@ -8,6 +8,7 @@ import android.graphics.Color
 import android.graphics.LinearGradient
 import android.graphics.Outline
 import android.graphics.Paint
+import android.graphics.Path
 import android.graphics.PixelFormat
 import android.graphics.RadialGradient
 import android.graphics.RectF
@@ -41,31 +42,34 @@ import org.webrtc.EglBase
  *  - Corner PiP (Un-hovered): 100% pure video card with 20s auto-dismiss timer.
  *  - Corner PiP (Hovered):
  *      • Auto-dismiss is cancelled (stays on until dismissed).
- *      • When hovering the PiP card itself, the card subtly swells (1.038x) with a directional
- *        Liquid Glass specular rim highlight — indicating it can be clicked to open Fullscreen
- *        with zero bottom-left button clutter.
- *      • A circular Liquid Glass `✕` orb animates into the top-right corner. Pressing Right/Up
- *        focuses the `✕` orb (which expands 1.16x with a bright specular lens highlight).
+ *      • When hovering the PiP card itself (CARD target), the card subtly swells (1.036x) with a
+ *        directional Liquid Glass specular rim highlight — indicating it can be clicked to open
+ *        Fullscreen with zero bottom-left button clutter.
+ *      • Two circular Liquid Glass orbs (`Audio Mute/Unmute` and `✕ Close`) animate into the
+ *        top-right corner. Pressing Right/Up moves focus onto `Audio`, then `✕`.
  *  - 88% Rounded Theater Fullscreen:
  *      • Background content stays at 100% full brightness (zero background dimming).
- *      • Two compact circular Liquid Glass icon orbs (`PiP Minimize` and `✕ Close`) sit in the
- *        top-right corner of the card and expand smoothly when hovered/focused.
+ *      • Three compact circular Liquid Glass icon orbs (`Audio Mute/Unmute`, `PiP Minimize`, and
+ *        `✕ Close`) sit in the top-right corner of the card and expand smoothly when focused.
  */
 class OverlayManager(private val context: Context) {
 
     private enum class PipFocusTarget {
         CARD,
+        AUDIO_BTN,
         DISMISS_BTN,
     }
 
     private enum class FullscreenFocusTarget {
+        AUDIO_BTN,
         PIP_BTN,
         DISMISS_BTN,
     }
 
     private enum class GlassIconType {
-        CLOSE_X,
+        AUDIO_TOGGLE,
         PIP_MINIMIZE,
+        CLOSE_X,
     }
 
     private val wm = context.getSystemService(Context.WINDOW_SERVICE) as WindowManager
@@ -87,14 +91,16 @@ class OverlayManager(private val context: Context) {
     private var connectingContainer: View? = null
     private var connectingPulseAnimator: ObjectAnimator? = null
 
-    // Liquid Glass card specular rim border
     private var glassRimView: LiquidGlassRimView? = null
 
-    // PiP top-right Liquid Glass `✕` orb
+    // PiP top-right Liquid Glass orbs (`Audio` + `✕`)
+    private var pipTopRightRow: LinearLayout? = null
+    private var pipAudioOrb: LiquidGlassOrbButton? = null
     private var pipCloseOrb: LiquidGlassOrbButton? = null
 
-    // Fullscreen top-right Liquid Glass icon orbs (PiP Minimize + Close `✕`)
+    // Fullscreen top-right Liquid Glass orbs (`Audio` + `PiP Minimize` + `✕`)
     private var fsTopRightRow: LinearLayout? = null
+    private var fsAudioOrb: LiquidGlassOrbButton? = null
     private var fsPipOrb: LiquidGlassOrbButton? = null
     private var fsCloseOrb: LiquidGlassOrbButton? = null
 
@@ -103,6 +109,7 @@ class OverlayManager(private val context: Context) {
     private var dismissRunnable: Runnable? = null
     private var onDismissCallback: (() -> Unit)? = null
     private var onKeepAliveCallback: (() -> Unit)? = null
+    private var onToggleAudioCallback: (() -> Boolean)? = null
 
     @Volatile
     var isShowing: Boolean = false
@@ -114,6 +121,10 @@ class OverlayManager(private val context: Context) {
 
     @Volatile
     var isKeepAlive: Boolean = false
+        private set
+
+    @Volatile
+    var isAudioActive: Boolean = false
         private set
 
     private var isPipHovered: Boolean = false
@@ -130,6 +141,7 @@ class OverlayManager(private val context: Context) {
         keepAliveUntilDismissed: Boolean = false,
         onFirstFrameVisible: () -> Unit,
         onKeepAliveActivated: () -> Unit = {},
+        onToggleAudio: () -> Boolean = { false },
         onAutoDismiss: () -> Unit,
     ): TextureViewRenderer? {
         if (!canDrawOverlays()) {
@@ -145,8 +157,10 @@ class OverlayManager(private val context: Context) {
         currentCfg = cfg
         onDismissCallback = onAutoDismiss
         onKeepAliveCallback = onKeepAliveActivated
+        onToggleAudioCallback = onToggleAudio
         isFullscreen = startFullscreen
         isKeepAlive = keepAliveUntilDismissed || startFullscreen
+        isAudioActive = false
         isPipHovered = false
         pipFocusTarget = PipFocusTarget.CARD
         fsFocusTarget = FullscreenFocusTarget.PIP_BTN
@@ -238,7 +252,6 @@ class OverlayManager(private val context: Context) {
             card.addView(buildSubtleLiveDot(pip.scaleX))
         }
 
-        // Build Liquid Glass rim + PiP & Fullscreen top-right Liquid Glass orbs
         buildLiquidGlassHud(card, pip, exp, startFullscreen)
 
         host.addView(card, FrameLayout.LayoutParams(screenW, screenH, Gravity.TOP or Gravity.START))
@@ -294,25 +307,42 @@ class OverlayManager(private val context: Context) {
                 }
             } else {
                 return when (keyCode) {
-                    KeyEvent.KEYCODE_DPAD_RIGHT, KeyEvent.KEYCODE_DPAD_UP -> {
-                        if (pipFocusTarget == PipFocusTarget.CARD) {
-                            setPipFocusTarget(PipFocusTarget.DISMISS_BTN)
+                    KeyEvent.KEYCODE_DPAD_RIGHT -> {
+                        when (pipFocusTarget) {
+                            PipFocusTarget.CARD -> setPipFocusTarget(PipFocusTarget.AUDIO_BTN)
+                            PipFocusTarget.AUDIO_BTN -> setPipFocusTarget(PipFocusTarget.DISMISS_BTN)
+                            PipFocusTarget.DISMISS_BTN -> Unit
                         }
                         true
                     }
-                    KeyEvent.KEYCODE_DPAD_LEFT, KeyEvent.KEYCODE_DPAD_DOWN -> {
-                        if (pipFocusTarget == PipFocusTarget.DISMISS_BTN) {
-                            setPipFocusTarget(PipFocusTarget.CARD)
-                        } else {
-                            setPipHovered(false)
+                    KeyEvent.KEYCODE_DPAD_UP -> {
+                        if (pipFocusTarget == PipFocusTarget.CARD) {
+                            setPipFocusTarget(PipFocusTarget.AUDIO_BTN)
+                        }
+                        true
+                    }
+                    KeyEvent.KEYCODE_DPAD_LEFT -> {
+                        when (pipFocusTarget) {
+                            PipFocusTarget.DISMISS_BTN -> setPipFocusTarget(PipFocusTarget.AUDIO_BTN)
+                            PipFocusTarget.AUDIO_BTN -> setPipFocusTarget(PipFocusTarget.CARD)
+                            PipFocusTarget.CARD -> setPipHovered(false)
+                        }
+                        true
+                    }
+                    KeyEvent.KEYCODE_DPAD_DOWN -> {
+                        when (pipFocusTarget) {
+                            PipFocusTarget.DISMISS_BTN, PipFocusTarget.AUDIO_BTN -> {
+                                setPipFocusTarget(PipFocusTarget.CARD)
+                            }
+                            PipFocusTarget.CARD -> setPipHovered(false)
                         }
                         true
                     }
                     KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER -> {
-                        if (pipFocusTarget == PipFocusTarget.DISMISS_BTN) {
-                            dismissAnimated()
-                        } else {
-                            setFullscreen(true)
+                        when (pipFocusTarget) {
+                            PipFocusTarget.CARD -> setFullscreen(true)
+                            PipFocusTarget.AUDIO_BTN -> performAudioToggle()
+                            PipFocusTarget.DISMISS_BTN -> dismissAnimated()
                         }
                         true
                     }
@@ -327,11 +357,19 @@ class OverlayManager(private val context: Context) {
             // 88% Rounded Theater Fullscreen Mode
             return when (keyCode) {
                 KeyEvent.KEYCODE_DPAD_LEFT -> {
-                    setFullscreenFocusTarget(FullscreenFocusTarget.PIP_BTN)
+                    when (fsFocusTarget) {
+                        FullscreenFocusTarget.DISMISS_BTN -> setFullscreenFocusTarget(FullscreenFocusTarget.PIP_BTN)
+                        FullscreenFocusTarget.PIP_BTN -> setFullscreenFocusTarget(FullscreenFocusTarget.AUDIO_BTN)
+                        FullscreenFocusTarget.AUDIO_BTN -> Unit
+                    }
                     true
                 }
                 KeyEvent.KEYCODE_DPAD_RIGHT -> {
-                    setFullscreenFocusTarget(FullscreenFocusTarget.DISMISS_BTN)
+                    when (fsFocusTarget) {
+                        FullscreenFocusTarget.AUDIO_BTN -> setFullscreenFocusTarget(FullscreenFocusTarget.PIP_BTN)
+                        FullscreenFocusTarget.PIP_BTN -> setFullscreenFocusTarget(FullscreenFocusTarget.DISMISS_BTN)
+                        FullscreenFocusTarget.DISMISS_BTN -> Unit
+                    }
                     true
                 }
                 KeyEvent.KEYCODE_DPAD_UP, KeyEvent.KEYCODE_DPAD_DOWN -> {
@@ -340,6 +378,7 @@ class OverlayManager(private val context: Context) {
                 }
                 KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER -> {
                     when (fsFocusTarget) {
+                        FullscreenFocusTarget.AUDIO_BTN -> performAudioToggle()
                         FullscreenFocusTarget.PIP_BTN -> setFullscreen(false)
                         FullscreenFocusTarget.DISMISS_BTN -> dismissAnimated()
                     }
@@ -352,6 +391,14 @@ class OverlayManager(private val context: Context) {
                 else -> false
             }
         }
+    }
+
+    private fun performAudioToggle() {
+        engageKeepAlive()
+        val active = onToggleAudioCallback?.invoke() ?: !isAudioActive
+        isAudioActive = active
+        pipAudioOrb?.setActiveToggleState(active)
+        fsAudioOrb?.setActiveToggleState(active)
     }
 
     private fun engageKeepAlive() {
@@ -414,11 +461,11 @@ class OverlayManager(private val context: Context) {
 
             if (expand) {
                 isPipHovered = false
-                pipCloseOrb?.animate()?.cancel()
-                pipCloseOrb?.animate()
+                pipTopRightRow?.animate()?.cancel()
+                pipTopRightRow?.animate()
                     ?.alpha(0f)
-                    ?.scaleX(0.6f)
-                    ?.scaleY(0.6f)
+                    ?.scaleX(0.7f)
+                    ?.scaleY(0.7f)
                     ?.setDuration(150L)
                     ?.start()
 
@@ -468,7 +515,7 @@ class OverlayManager(private val context: Context) {
                 }
 
                 isPipHovered = false
-                pipCloseOrb?.alpha = 0f
+                pipTopRightRow?.alpha = 0f
                 glassRimView?.animate()?.alpha(0f)?.setDuration(200L)?.start()
 
                 card.elevation = dp(18).toFloat()
@@ -560,6 +607,7 @@ class OverlayManager(private val context: Context) {
         connectingPulseAnimator = null
         onDismissCallback = null
         onKeepAliveCallback = null
+        onToggleAudioCallback = null
 
         val r = renderer
         renderer = null
@@ -572,13 +620,17 @@ class OverlayManager(private val context: Context) {
         currentCfg = null
         connectingContainer = null
         glassRimView = null
+        pipTopRightRow = null
+        pipAudioOrb = null
         pipCloseOrb = null
         fsTopRightRow = null
+        fsAudioOrb = null
         fsPipOrb = null
         fsCloseOrb = null
         isShowing = false
         isFullscreen = false
         isKeepAlive = false
+        isAudioActive = false
         isPipHovered = false
         isHiding = false
 
@@ -736,24 +788,59 @@ class OverlayManager(private val context: Context) {
         glassRimView = rim
         card.addView(rim)
 
-        // 2. Corner PiP Top-Right Liquid Glass `✕` Orb (no bottom-left fullscreen button!)
+        // 2. Corner PiP Top-Right Liquid Glass Orbs (`Audio Mute/Unmute` + `✕ Close`)
         val pipOrbSize = pipDp(36, pipS)
-        val pipOrbMargin = pipDp(12, pipS)
-        val closeOrb = LiquidGlassOrbButton(
-            context = context,
-            iconType = GlassIconType.CLOSE_X,
-            strokeScalePx = pipDp(1, pipS).toFloat(),
-        ).apply {
+        val pipOrbGap = pipDp(10, pipS)
+        val pipOrbMargin = pipDp(10, pipS)
+        val pipPad = pipDp(5, pipS)
+
+        val pipRow = LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            clipChildren = false
+            clipToPadding = false
+            setPadding(pipPad, pipPad, pipPad, pipPad)
             alpha = 0f
-            scaleX = 0.6f
-            scaleY = 0.6f
+            scaleX = 0.7f
+            scaleY = 0.7f
             layoutParams = FrameLayout.LayoutParams(
-                pipOrbSize,
-                pipOrbSize,
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                FrameLayout.LayoutParams.WRAP_CONTENT,
                 Gravity.TOP or Gravity.END,
             ).apply {
                 setMargins(0, pipOrbMargin, pipOrbMargin, 0)
             }
+        }
+        pipTopRightRow = pipRow
+
+        val pAudioOrb = LiquidGlassOrbButton(
+            context = context,
+            iconType = GlassIconType.AUDIO_TOGGLE,
+            strokeScalePx = pipDp(1, pipS).toFloat(),
+        ).apply {
+            layoutParams = LinearLayout.LayoutParams(pipOrbSize, pipOrbSize).apply {
+                rightMargin = pipOrbGap
+            }
+            setOnHoverListener { _, ev ->
+                if (!isFullscreen && !isHiding && ev.actionMasked == MotionEvent.ACTION_HOVER_ENTER) {
+                    setPipHovered(true, PipFocusTarget.AUDIO_BTN)
+                }
+                false
+            }
+            setOnClickListener {
+                if (!isHiding) {
+                    performAudioToggle()
+                }
+            }
+        }
+        pipAudioOrb = pAudioOrb
+
+        val pCloseOrb = LiquidGlassOrbButton(
+            context = context,
+            iconType = GlassIconType.CLOSE_X,
+            strokeScalePx = pipDp(1, pipS).toFloat(),
+        ).apply {
+            layoutParams = LinearLayout.LayoutParams(pipOrbSize, pipOrbSize)
             setOnHoverListener { _, ev ->
                 if (!isFullscreen && !isHiding && ev.actionMasked == MotionEvent.ACTION_HOVER_ENTER) {
                     setPipHovered(true, PipFocusTarget.DISMISS_BTN)
@@ -766,10 +853,13 @@ class OverlayManager(private val context: Context) {
                 }
             }
         }
-        pipCloseOrb = closeOrb
-        card.addView(closeOrb)
+        pipCloseOrb = pCloseOrb
 
-        // 3. Fullscreen Top-Right Liquid Glass Icon Orbs (`PiP Minimize` + `✕ Close`)
+        pipRow.addView(pAudioOrb)
+        pipRow.addView(pCloseOrb)
+        card.addView(pipRow)
+
+        // 3. Fullscreen Top-Right Liquid Glass Icon Orbs (`Audio` + `PiP Minimize` + `✕ Close`)
         val fsRowMargin = expDp(18, expS)
         val fsOrbSize = expDp(42, expS)
         val fsOrbGap = expDp(12, expS)
@@ -792,6 +882,28 @@ class OverlayManager(private val context: Context) {
             }
         }
         fsTopRightRow = topRightRow
+
+        val fAudioOrb = LiquidGlassOrbButton(
+            context = context,
+            iconType = GlassIconType.AUDIO_TOGGLE,
+            strokeScalePx = expDp(1, expS).toFloat(),
+        ).apply {
+            layoutParams = LinearLayout.LayoutParams(fsOrbSize, fsOrbSize).apply {
+                rightMargin = fsOrbGap
+            }
+            setOnHoverListener { _, ev ->
+                if (isFullscreen && ev.actionMasked == MotionEvent.ACTION_HOVER_ENTER) {
+                    setFullscreenFocusTarget(FullscreenFocusTarget.AUDIO_BTN)
+                }
+                false
+            }
+            setOnClickListener {
+                if (isFullscreen && !isHiding) {
+                    performAudioToggle()
+                }
+            }
+        }
+        fsAudioOrb = fAudioOrb
 
         val pipMinOrb = LiquidGlassOrbButton(
             context = context,
@@ -835,6 +947,7 @@ class OverlayManager(private val context: Context) {
         }
         fsCloseOrb = fsDismissOrb
 
+        topRightRow.addView(fAudioOrb)
         topRightRow.addView(pipMinOrb)
         topRightRow.addView(fsDismissOrb)
         card.addView(topRightRow)
@@ -848,17 +961,19 @@ class OverlayManager(private val context: Context) {
         val pip = computePipTransform(cfg)
         val pipS = pip.scaleX.coerceAtLeast(0.15f)
         val rim = glassRimView ?: return
+        val pipRow = pipTopRightRow ?: return
+        val audioOrb = pipAudioOrb ?: return
         val closeOrb = pipCloseOrb ?: return
 
         if (!isPipHovered || isFullscreen) {
             rim.animate().cancel()
-            closeOrb.animate().cancel()
+            pipRow.animate().cancel()
             if (animated) {
                 rim.animate().alpha(0f).setDuration(160L).start()
-                closeOrb.animate()
+                pipRow.animate()
                     .alpha(0f)
-                    .scaleX(0.6f)
-                    .scaleY(0.6f)
+                    .scaleX(0.7f)
+                    .scaleY(0.7f)
                     .setDuration(170L)
                     .setInterpolator(exitEase)
                     .start()
@@ -874,27 +989,29 @@ class OverlayManager(private val context: Context) {
                 }
             } else {
                 rim.alpha = 0f
-                closeOrb.alpha = 0f
-                closeOrb.scaleX = 0.6f
-                closeOrb.scaleY = 0.6f
+                pipRow.alpha = 0f
+                pipRow.scaleX = 0.7f
+                pipRow.scaleY = 0.7f
             }
             return
         }
 
+        val onCard = pipFocusTarget == PipFocusTarget.CARD
+        val onAudio = pipFocusTarget == PipFocusTarget.AUDIO_BTN
         val onDismiss = pipFocusTarget == PipFocusTarget.DISMISS_BTN
+
+        audioOrb.setFocusedState(onAudio)
         closeOrb.setFocusedState(onDismiss)
 
-        // When hovering the PiP card itself (CARD target), gently swell the PiP card by 3.6%
-        // with a bright Liquid Glass specular rim so it clearly feels clickable for Fullscreen!
-        val cardHoverFactor = if (!onDismiss) 1.036f else 1.0f
+        val cardHoverFactor = if (onCard) 1.036f else 1.0f
         val targetScaleX = pip.scaleX * cardHoverFactor
         val targetScaleY = pip.scaleY * cardHoverFactor
         val targetX = pip.x - (cfg.overlayWidthPx * (cardHoverFactor - 1f) * 0.5f)
         val targetY = pip.y - (cfg.overlayHeightPx * (cardHoverFactor - 1f) * 0.5f)
 
-        rim.setStrokeState(pipDp(2, pipS).toFloat(), bright = !onDismiss)
+        rim.setStrokeState(pipDp(2, pipS).toFloat(), bright = onCard)
         rim.animate().cancel()
-        rim.animate().alpha(if (!onDismiss) 1f else 0.55f).setDuration(180L).start()
+        rim.animate().alpha(if (onCard) 1f else 0.55f).setDuration(180L).start()
 
         card.animate().cancel()
         card.animate()
@@ -906,42 +1023,45 @@ class OverlayManager(private val context: Context) {
             .setInterpolator(popSpring)
             .start()
 
-        val orbScale = if (onDismiss) 1.16f else 1.0f
-        closeOrb.animate().cancel()
-        closeOrb.animate()
+        pipRow.animate().cancel()
+        pipRow.animate()
             .alpha(1f)
-            .scaleX(orbScale)
-            .scaleY(orbScale)
-            .setDuration(if (visibilityChanged) 240L else 170L)
+            .scaleX(1f)
+            .scaleY(1f)
+            .setDuration(if (visibilityChanged) 230L else 150L)
             .setInterpolator(popSpring)
             .start()
+
+        val audioScale = if (onAudio) 1.16f else 0.98f
+        val closeScale = if (onDismiss) 1.16f else 0.98f
+        audioOrb.animate().scaleX(audioScale).scaleY(audioScale).setDuration(170L).setInterpolator(popSpring).start()
+        closeOrb.animate().scaleX(closeScale).scaleY(closeScale).setDuration(170L).setInterpolator(popSpring).start()
     }
 
     private fun updateFullscreenHudStyles(animated: Boolean) {
+        val audioOrb = fsAudioOrb ?: return
         val pipOrb = fsPipOrb ?: return
         val closeOrb = fsCloseOrb ?: return
+
+        val onAudio = fsFocusTarget == FullscreenFocusTarget.AUDIO_BTN
         val onPip = fsFocusTarget == FullscreenFocusTarget.PIP_BTN
+        val onClose = fsFocusTarget == FullscreenFocusTarget.DISMISS_BTN
 
+        audioOrb.setFocusedState(onAudio)
         pipOrb.setFocusedState(onPip)
-        closeOrb.setFocusedState(!onPip)
+        closeOrb.setFocusedState(onClose)
 
+        val audioScale = if (onAudio) 1.15f else 0.96f
         val pipScale = if (onPip) 1.15f else 0.96f
-        val closeScale = if (!onPip) 1.15f else 0.96f
+        val closeScale = if (onClose) 1.15f else 0.96f
 
         if (animated) {
-            pipOrb.animate()
-                .scaleX(pipScale)
-                .scaleY(pipScale)
-                .setDuration(180L)
-                .setInterpolator(popSpring)
-                .start()
-            closeOrb.animate()
-                .scaleX(closeScale)
-                .scaleY(closeScale)
-                .setDuration(180L)
-                .setInterpolator(popSpring)
-                .start()
+            audioOrb.animate().scaleX(audioScale).scaleY(audioScale).setDuration(180L).setInterpolator(popSpring).start()
+            pipOrb.animate().scaleX(pipScale).scaleY(pipScale).setDuration(180L).setInterpolator(popSpring).start()
+            closeOrb.animate().scaleX(closeScale).scaleY(closeScale).setDuration(180L).setInterpolator(popSpring).start()
         } else {
+            audioOrb.scaleX = audioScale
+            audioOrb.scaleY = audioScale
             pipOrb.scaleX = pipScale
             pipOrb.scaleY = pipScale
             closeOrb.scaleX = closeScale
@@ -949,9 +1069,6 @@ class OverlayManager(private val context: Context) {
         }
     }
 
-    /**
-     * Directional Liquid Glass specular rim border around the rounded video card.
-     */
     private inner class LiquidGlassRimView(context: Context) : View(context) {
         private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             style = Paint.Style.STROKE
@@ -1006,11 +1123,7 @@ class OverlayManager(private val context: Context) {
     }
 
     /**
-     * Custom-rendered Apple visionOS / iOS Liquid Glass circular orb button with:
-     *  - Translucent diagonal glass body gradient
-     *  - Top-left internal caustic lens refraction radial highlight
-     *  - Dual-angle directional specular rim stroke
-     *  - Crisp anti-aliased vector iconography (no font text glyphs)
+     * Custom-rendered Apple visionOS / iOS Liquid Glass circular orb button.
      */
     private inner class LiquidGlassOrbButton(
         context: Context,
@@ -1019,6 +1132,7 @@ class OverlayManager(private val context: Context) {
     ) : View(context) {
 
         private var isFocusedOrb = false
+        private var isActiveToggle = false
         private val bodyPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
         private val lensPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
         private val rimPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE }
@@ -1033,10 +1147,18 @@ class OverlayManager(private val context: Context) {
             color = Color.WHITE
         }
         private val rect = RectF()
+        private val speakerPath = Path()
 
         fun setFocusedState(focused: Boolean) {
             if (isFocusedOrb == focused) return
             isFocusedOrb = focused
+            rebuildShaders(width, height)
+            invalidate()
+        }
+
+        fun setActiveToggleState(active: Boolean) {
+            if (isActiveToggle == active) return
+            isActiveToggle = active
             rebuildShaders(width, height)
             invalidate()
         }
@@ -1051,15 +1173,24 @@ class OverlayManager(private val context: Context) {
             val wf = w.toFloat()
             val hf = h.toFloat()
 
-            // 1. Translucent Liquid Glass body fill
-            val bodyColors = if (isFocusedOrb) {
-                intArrayOf(
+            // 1. Translucent Liquid Glass body fill (luminous cyan-glass tint when audio toggle is active)
+            val bodyColors = when {
+                isActiveToggle && isFocusedOrb -> intArrayOf(
+                    Color.parseColor("#B02D6A9F"),
+                    Color.parseColor("#961E4870"),
+                    Color.parseColor("#A6265C8C"),
+                )
+                isActiveToggle -> intArrayOf(
+                    Color.parseColor("#8C22537D"),
+                    Color.parseColor("#78163754"),
+                    Color.parseColor("#851D476B"),
+                )
+                isFocusedOrb -> intArrayOf(
                     Color.parseColor("#9434465E"),
                     Color.parseColor("#801C2636"),
                     Color.parseColor("#8C2A384D"),
                 )
-            } else {
-                intArrayOf(
+                else -> intArrayOf(
                     Color.parseColor("#6E161E2B"),
                     Color.parseColor("#5C0D121A"),
                     Color.parseColor("#66131A26"),
@@ -1073,8 +1204,8 @@ class OverlayManager(private val context: Context) {
             )
 
             // 2. Top-left internal specular lens caustic refraction
-            val causticTopAlpha = if (isFocusedOrb) "#60FFFFFF" else "#2EFFFFFF"
-            val causticMidAlpha = if (isFocusedOrb) "#1EFFFFFF" else "#0CFFFFFF"
+            val causticTopAlpha = if (isFocusedOrb || isActiveToggle) "#66FFFFFF" else "#2EFFFFFF"
+            val causticMidAlpha = if (isFocusedOrb || isActiveToggle) "#22D4F0FF" else "#0CFFFFFF"
             lensPaint.shader = RadialGradient(
                 wf * 0.30f,
                 hf * 0.24f,
@@ -1090,11 +1221,11 @@ class OverlayManager(private val context: Context) {
 
             // 3. Directional specular glass rim
             rimPaint.strokeWidth = strokeScalePx * (if (isFocusedOrb) 1.85f else 1.25f)
-            val rimColors = if (isFocusedOrb) {
+            val rimColors = if (isFocusedOrb || isActiveToggle) {
                 intArrayOf(
                     Color.parseColor("#FFFFFFFF"),
-                    Color.parseColor("#70D6ECFF"),
-                    Color.parseColor("#38FFFFFF"),
+                    Color.parseColor("#80B8E8FF"),
+                    Color.parseColor("#40FFFFFF"),
                     Color.parseColor("#D9FFFFFF"),
                 )
             } else {
@@ -1112,7 +1243,7 @@ class OverlayManager(private val context: Context) {
                 Shader.TileMode.CLAMP,
             )
 
-            iconPaint.color = if (isFocusedOrb) Color.WHITE else Color.parseColor("#D9FFFFFF")
+            iconPaint.color = if (isFocusedOrb || isActiveToggle) Color.WHITE else Color.parseColor("#D9FFFFFF")
             iconFillPaint.color = iconPaint.color
         }
 
@@ -1125,7 +1256,6 @@ class OverlayManager(private val context: Context) {
             val cy = hf * 0.5f
             val radius = minOf(wf, hf) * 0.5f - rimPaint.strokeWidth * 0.6f
 
-            // Draw glass body, caustic refraction lens, and specular rim
             canvas.drawCircle(cx, cy, radius, bodyPaint)
             canvas.drawCircle(cx, cy, radius, lensPaint)
             canvas.drawCircle(cx, cy, radius, rimPaint)
@@ -1138,7 +1268,6 @@ class OverlayManager(private val context: Context) {
                     canvas.drawLine(cx + d, cy - d, cx - d, cy + d, iconPaint)
                 }
                 GlassIconType.PIP_MINIMIZE -> {
-                    // Crisp vector Picture-in-Picture icon: rounded outer frame + filled top-right mini PiP window
                     iconPaint.strokeWidth = strokeScalePx * 1.65f
                     val ow = radius * 0.88f
                     val oh = radius * 0.66f
@@ -1146,7 +1275,6 @@ class OverlayManager(private val context: Context) {
                     rect.set(cx - ow * 0.5f, cy - oh * 0.5f, cx + ow * 0.5f, cy + oh * 0.5f)
                     canvas.drawRoundRect(rect, cr, cr, iconPaint)
 
-                    // Filled mini PiP window in top-right quadrant of the frame
                     val pw = ow * 0.42f
                     val ph = oh * 0.42f
                     val inset = strokeScalePx * 2.1f
@@ -1158,6 +1286,42 @@ class OverlayManager(private val context: Context) {
                     )
                     val pcr = strokeScalePx * 1.2f
                     canvas.drawRoundRect(rect, pcr, pcr, iconFillPaint)
+                }
+                GlassIconType.AUDIO_TOGGLE -> {
+                    // Geometric SF-Symbol style Speaker Cone + Sound Waves (+ Mute Slash when muted)
+                    val spkLeft = cx - radius * 0.42f
+                    val spkMid = cx - radius * 0.24f
+                    val spkRight = cx - radius * 0.02f
+                    val boxHalfH = radius * 0.16f
+                    val coneHalfH = radius * 0.36f
+
+                    speakerPath.reset()
+                    speakerPath.moveTo(spkLeft, cy - boxHalfH)
+                    speakerPath.lineTo(spkMid, cy - boxHalfH)
+                    speakerPath.lineTo(spkRight, cy - coneHalfH)
+                    speakerPath.lineTo(spkRight, cy + coneHalfH)
+                    speakerPath.lineTo(spkMid, cy + boxHalfH)
+                    speakerPath.lineTo(spkLeft, cy + boxHalfH)
+                    speakerPath.close()
+                    canvas.drawPath(speakerPath, iconFillPaint)
+
+                    iconPaint.strokeWidth = strokeScalePx * 1.65f
+                    if (isActiveToggle) {
+                        // Active audio waves: two crisp arcs radiating right
+                        val r1 = radius * 0.24f
+                        rect.set(spkRight - r1 * 0.3f, cy - r1, spkRight + r1 * 1.3f, cy + r1)
+                        canvas.drawArc(rect, -42f, 84f, false, iconPaint)
+
+                        val r2 = radius * 0.42f
+                        rect.set(spkRight - r2 * 0.3f, cy - r2, spkRight + r2 * 1.3f, cy + r2)
+                        canvas.drawArc(rect, -45f, 90f, false, iconPaint)
+                    } else {
+                        // Muted speaker: small x mark to the right of the speaker cone
+                        val mx = cx + radius * 0.23f
+                        val md = radius * 0.16f
+                        canvas.drawLine(mx - md, cy - md, mx + md, cy + md, iconPaint)
+                        canvas.drawLine(mx + md, cy - md, mx - md, cy + md, iconPaint)
+                    }
                 }
             }
         }

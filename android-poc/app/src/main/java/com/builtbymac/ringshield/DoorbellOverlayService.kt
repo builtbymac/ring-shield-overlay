@@ -35,6 +35,7 @@ class DoorbellOverlayService : Service() {
     private lateinit var overlayManager: OverlayManager
     private lateinit var webrtc: WebRtcEngine
     private lateinit var relay: RelayClient
+    private lateinit var backgroundMediaCtrl: BackgroundMediaController
 
     private var reconnectJob: Job? = null
     private var prewarmExpiryJob: Job? = null
@@ -44,6 +45,8 @@ class DoorbellOverlayService : Service() {
     private var prewarmedOffer: PrewarmedOffer? = null
     private var activeOffer: PrewarmedOffer? = null
     private var activeVideoTrack: org.webrtc.VideoTrack? = null
+    private var activeAudioTrack: org.webrtc.AudioTrack? = null
+    private var isDoorbellAudioEnabled: Boolean = false
     private var activeRenderer: TextureViewRenderer? = null
     private var activeSessionUrl: String? = null
     private var activeDeviceId: String? = null
@@ -58,6 +61,7 @@ class DoorbellOverlayService : Service() {
         cfg = ConfigStore.load(this)
         latencyLogger = LatencyLogger(this)
         overlayManager = OverlayManager(this)
+        backgroundMediaCtrl = BackgroundMediaController(this)
         webrtc = WebRtcEngine(applicationContext, cfg.softwareDecoder, cfg.minPlayoutDelayMs)
         relay = RelayClient(
             cfg = cfg,
@@ -279,6 +283,9 @@ class DoorbellOverlayService : Service() {
                     onKeepAliveActivated = {
                         armSeamlessRollover(deviceId)
                     },
+                    onToggleAudio = {
+                        toggleDoorbellAudio()
+                    },
                     onAutoDismiss = {
                         if (!trial.success && trial.error == null) {
                             trial.error = "overlay_timeout_no_video_frame"
@@ -299,6 +306,21 @@ class DoorbellOverlayService : Service() {
                 activeSessionUrl = answer.sessionUrl
 
                 webrtc.applyAnswer(offer, answer.sdpAnswer, cfg.stripTwcc)
+
+                // Bind remote AudioTrack as soon as it arrives (stays muted unless user toggled audio ON)
+                if (cfg.includeAudioTransceiver) {
+                    scope.launch {
+                        runCatching {
+                            val audioTrack = withTimeout(10_000L) { offer.audioTrackDeferred.await() }
+                            withContext(Dispatchers.Main.immediate) {
+                                if (activeOffer === offer) {
+                                    activeAudioTrack = audioTrack
+                                    webrtc.setDoorbellAudioEnabled(audioTrack, isDoorbellAudioEnabled)
+                                }
+                            }
+                        }
+                    }
+                }
 
                 // Wait for remote VideoTrack & attach directly to GPU TextureViewRenderer
                 val videoTrack = withTimeout(10_000L) { offer.videoTrackDeferred.await() }
@@ -375,6 +397,9 @@ class DoorbellOverlayService : Service() {
                     webrtc.applyAnswer(nextOffer, answer.sdpAnswer, cfg.stripTwcc)
 
                     val nextTrack = withTimeout(8_000L) { nextOffer.videoTrackDeferred.await() }
+                    val nextAudioTrack = if (cfg.includeAudioTransceiver) {
+                        kotlinx.coroutines.withTimeoutOrNull(1_500L) { nextOffer.audioTrackDeferred.await() }
+                    } else null
                     val firstFrameReady = kotlinx.coroutines.CompletableDeferred<Unit>()
                     val probeSink = org.webrtc.VideoSink { _ -> firstFrameReady.complete(Unit) }
                     withContext(Dispatchers.Main.immediate) {
@@ -384,6 +409,7 @@ class DoorbellOverlayService : Service() {
 
                     // Atomic hot-swap onto the existing TextureViewRenderer with zero black screen!
                     val oldTrack = activeVideoTrack
+                    val oldAudio = activeAudioTrack
                     val oldOffer = activeOffer
                     val oldSessionUrl = activeSessionUrl
 
@@ -395,9 +421,12 @@ class DoorbellOverlayService : Service() {
                             return@withContext
                         }
                         oldTrack?.let { runCatching { it.removeSink(renderer) } }
+                        oldAudio?.let { runCatching { it.setEnabled(false) } }
                         nextTrack.removeSink(probeSink)
                         nextTrack.addSink(renderer)
                         activeVideoTrack = nextTrack
+                        activeAudioTrack = nextAudioTrack
+                        webrtc.setDoorbellAudioEnabled(nextAudioTrack, isDoorbellAudioEnabled)
                         activeOffer = nextOffer
                         activeSessionUrl = nextSessionUrl
                     }
@@ -417,10 +446,34 @@ class DoorbellOverlayService : Service() {
         }
     }
 
+    private fun toggleDoorbellAudio(): Boolean {
+        val nextState = !isDoorbellAudioEnabled
+        isDoorbellAudioEnabled = nextState
+        if (nextState) {
+            backgroundMediaCtrl.onDoorbellAudioEnabled()
+            webrtc.setDoorbellAudioEnabled(activeAudioTrack, true)
+        } else {
+            webrtc.setDoorbellAudioEnabled(activeAudioTrack, false)
+            backgroundMediaCtrl.onDoorbellAudioDisabled()
+        }
+        return nextState
+    }
+
     private fun stopActiveStream() {
         rolloverJob?.cancel()
         rolloverJob = null
         activeDeviceId = null
+
+        val wasAudioEnabled = isDoorbellAudioEnabled
+        isDoorbellAudioEnabled = false
+        val aTrack = activeAudioTrack
+        activeAudioTrack = null
+        webrtc.setDoorbellAudioEnabled(aTrack, false)
+        if (wasAudioEnabled) {
+            backgroundMediaCtrl.onDoorbellAudioDisabled()
+        } else {
+            backgroundMediaCtrl.onDoorbellAudioDisabled()
+        }
 
         val track = activeVideoTrack
         val rend = activeRenderer
