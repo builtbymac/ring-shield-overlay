@@ -123,8 +123,9 @@ class MainActivity : AppCompatActivity() {
         durationBtn = tvButton("") {
             updateConfig {
                 val next = when (it.overlayDurationSec) {
-                    in 0..19 -> 25
-                    in 20..27 -> 29
+                    in 0..19 -> 20
+                    20 -> 25
+                    in 21..27 -> 30
                     else -> 15
                 }
                 it.copy(overlayDurationSec = next)
@@ -136,8 +137,8 @@ class MainActivity : AppCompatActivity() {
         smoothBtn = tvButton("") {
             updateConfig {
                 val next = when (it.minPlayoutDelayMs) {
-                    0 -> 350
-                    in 1..400 -> 500
+                    0 -> 200
+                    in 1..250 -> 350
                     else -> 0
                 }
                 it.copy(minPlayoutDelayMs = next)
@@ -188,6 +189,10 @@ class MainActivity : AppCompatActivity() {
 
     override fun onResume() {
         super.onResume()
+        ContextCompat.startForegroundService(
+            this,
+            Intent(this, DoorbellOverlayService::class.java)
+        )
         uiHandler.removeCallbacks(statusTicker)
         statusTicker.run()
     }

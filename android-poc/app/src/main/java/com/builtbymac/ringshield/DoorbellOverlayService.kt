@@ -76,6 +76,7 @@ class DoorbellOverlayService : Service() {
 
         registerNetworkWatcher()
         relay.connect()
+        scope.launch { prewarmPipeline() }
         Log.i(TAG, "Service started (mode=${cfg.mode}, relay=${cfg.relayUrl}, swDec=${cfg.softwareDecoder})")
     }
 
@@ -98,6 +99,11 @@ class DoorbellOverlayService : Service() {
             }
             ACTION_RELOAD_CONFIG -> {
                 reloadConfig()
+            }
+            else -> {
+                if (activeOffer == null && prewarmedOffer == null) {
+                    scope.launch { prewarmPipeline() }
+                }
             }
         }
         return START_STICKY
@@ -154,7 +160,7 @@ class DoorbellOverlayService : Service() {
                 synthetic = true,
             ),
             startFullscreen = startFullscreen,
-            keepAliveUntilDismissed = true,
+            keepAliveUntilDismissed = startFullscreen,
         )
     }
 
@@ -434,6 +440,14 @@ class DoorbellOverlayService : Service() {
         activeSessionUrl = null
         if (sessionUrl != null) {
             scope.launch { relay.stopWhep(sessionUrl) }
+        }
+        if (offer != null && prewarmedOffer == null) {
+            scope.launch {
+                delay(400L)
+                if (activeOffer == null && prewarmedOffer == null) {
+                    prewarmPipeline()
+                }
+            }
         }
     }
 
