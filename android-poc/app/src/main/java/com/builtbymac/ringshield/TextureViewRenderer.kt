@@ -25,6 +25,7 @@ class TextureViewRenderer(context: Context) : TextureView(context),
 
     private val eglRenderer = EglRenderer("RingOverlayRenderer")
     private var initialized = false
+    @Volatile private var hasReceivedWebRtcFrame = false
     private var firstFrameNotified = false
     private var onFirstFrame: (() -> Unit)? = null
     private var onResolutionChanged: ((Int, Int) -> Unit)? = null
@@ -42,6 +43,7 @@ class TextureViewRenderer(context: Context) : TextureView(context),
     ) {
         if (initialized) return
         initialized = true
+        hasReceivedWebRtcFrame = false
         firstFrameNotified = false
         this.onFirstFrame = onFirstFrame
         this.onResolutionChanged = onResolutionChanged
@@ -54,13 +56,12 @@ class TextureViewRenderer(context: Context) : TextureView(context),
     }
 
     override fun onFrame(frame: VideoFrame) {
-        if (!firstFrameNotified) {
-            firstFrameNotified = true
+        if (!hasReceivedWebRtcFrame) {
+            hasReceivedWebRtcFrame = true
             val w = frame.rotatedWidth
             val h = frame.rotatedHeight
             Log.i(TAG, "First WebRTC video frame received (${w}x${h})")
             onResolutionChanged?.invoke(w, h)
-            onFirstFrame?.invoke()
         }
         eglRenderer.onFrame(frame)
     }
@@ -88,7 +89,13 @@ class TextureViewRenderer(context: Context) : TextureView(context),
         return true
     }
 
-    override fun onSurfaceTextureUpdated(surface: SurfaceTexture) = Unit
+    override fun onSurfaceTextureUpdated(surface: SurfaceTexture) {
+        if (hasReceivedWebRtcFrame && !firstFrameNotified) {
+            firstFrameNotified = true
+            Log.i(TAG, "First WebRTC video frame swapped to SurfaceTexture")
+            onFirstFrame?.invoke()
+        }
+    }
 
     fun release() {
         if (!initialized) return

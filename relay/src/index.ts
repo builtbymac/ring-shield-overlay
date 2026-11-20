@@ -7,7 +7,14 @@ import {
   RequestIdCache,
   verifyHmacSignature,
 } from './webhook.js'
-import { discoverDevices, startWhepSession, stopWhepSession } from './whep.js'
+import {
+  discoverDevices,
+  getLastCapturedSdpOffer,
+  probeRtspStream,
+  rewriteSdpForHevc,
+  startWhepSession,
+  stopWhepSession,
+} from './whep.js'
 import { ShieldWsHub } from './wsHub.js'
 
 const MAX_BODY_BYTES = 256 * 1024
@@ -195,6 +202,48 @@ async function main(): Promise<void> {
       if (method === 'GET' && url.pathname === '/api/devices') {
         const devices = await discoverDevices(auth)
         sendJson(res, 200, { devices })
+        return
+      }
+
+      // RTSPS DESCRIBE probe (LAN-only diagnostic for native HEVC / 1080p stream)
+      if (method === 'GET' && url.pathname === '/api/rtsp/probe') {
+        const deviceId = url.searchParams.get('deviceId') || cfg.defaultDeviceId
+        if (!deviceId) {
+          sendJson(res, 400, { error: 'Missing deviceId' })
+          return
+        }
+        const probe = await probeRtspStream(auth, deviceId)
+        sendJson(res, 200, probe)
+        return
+      }
+
+      // WHEP HEVC negotiation probe (tests H265-only or H265-first SDP offer against Ring WHEP)
+      if (method === 'GET' && url.pathname === '/api/whep/probe-hevc') {
+        const deviceId = url.searchParams.get('deviceId') || cfg.defaultDeviceId
+        const mode = (url.searchParams.get('mode') === 'h265_first' ? 'h265_first' : 'h265_only') as
+          | 'h265_only'
+          | 'h265_first'
+        const baseOffer = getLastCapturedSdpOffer()
+        if (!deviceId || !baseOffer) {
+          sendJson(res, 400, { error: 'Trigger at least one WHEP session first so a base SDP offer is captured' })
+          return
+        }
+        const modifiedOffer = rewriteSdpForHevc(baseOffer, mode)
+        const result = await startWhepSession(auth, deviceId, modifiedOffer)
+        if (result.sessionUrl) {
+          await stopWhepSession(auth, result.sessionUrl).catch(() => {})
+        }
+        sendJson(res, 200, {
+          mode,
+          ringRttMs: result.ringRttMs,
+          baseOfferCodecs: baseOffer
+            .split(/\r?\n/)
+            .filter((l) => /^(m=|a=rtpmap:|a=fmtp:)/.test(l)),
+          modifiedOfferCodecs: modifiedOffer
+            .split(/\r?\n/)
+            .filter((l) => /^(m=|a=rtpmap:|a=fmtp:)/.test(l)),
+          sdpAnswer: result.sdpAnswer,
+        })
         return
       }
 
