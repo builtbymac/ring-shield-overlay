@@ -25,6 +25,11 @@ export class ShieldWsHub {
         socket.destroy()
         return
       }
+      if (req.headers['cf-ray'] || req.headers['cf-connecting-ip']) {
+        socket.write('HTTP/1.1 403 Forbidden\r\n\r\n')
+        socket.destroy()
+        return
+      }
       if (lanToken) {
         const provided =
           url.searchParams.get('token') ??

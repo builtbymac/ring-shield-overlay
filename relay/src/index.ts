@@ -145,7 +145,11 @@ async function main(): Promise<void> {
         return
       }
 
-      // LAN-only endpoints below
+      // LAN-only endpoints below: never expose over Cloudflare Tunnel
+      if (req.headers['cf-ray'] || req.headers['cf-connecting-ip']) {
+        sendJson(res, 403, { error: 'LAN-only endpoint' })
+        return
+      }
       if (!checkLanAuth(req, cfg.lanToken)) {
         sendJson(res, 401, { error: 'Unauthorized LAN client' })
         return
