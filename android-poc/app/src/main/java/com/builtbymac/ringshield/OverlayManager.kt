@@ -225,6 +225,7 @@ class OverlayManager(private val context: Context) {
             alpha = 0f
             init(
                 eglContext = eglContext,
+                inpaintWatermarks = cfg.cropRingWatermark,
                 onFirstFrame = {
                     mainHandler.post {
                         if (hostWindow === host && !isHiding) {

@@ -32,7 +32,7 @@ data class PocConfig(
     val iceGatherBudgetMs: Long = 1500L,
     val prewarmTtlMs: Long = 45_000L,
     val minPlayoutDelayMs: Int = 200,
-    val cropRingWatermark: Boolean = false,
+    val cropRingWatermark: Boolean = true,
     val showLiveDot: Boolean = false,
     val showCountdownBar: Boolean = false,
 )
@@ -73,7 +73,7 @@ object ConfigStore {
                 iceGatherBudgetMs = json.optLong("iceGatherBudgetMs", 1500L).coerceIn(50L, 5000L),
                 prewarmTtlMs = json.optLong("prewarmTtlMs", 45_000L).coerceIn(5_000L, 90_000L),
                 minPlayoutDelayMs = json.optInt("minPlayoutDelayMs", 200).coerceIn(0, 1500),
-                cropRingWatermark = json.optBoolean("cropRingWatermark", false),
+                cropRingWatermark = json.optBoolean("cropRingWatermark", true),
                 showLiveDot = json.optBoolean("showLiveDot", false),
                 showCountdownBar = json.optBoolean("showCountdownBar", false),
             )

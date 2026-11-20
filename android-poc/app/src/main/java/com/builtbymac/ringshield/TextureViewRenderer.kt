@@ -38,6 +38,7 @@ class TextureViewRenderer(context: Context) : TextureView(context),
 
     fun init(
         eglContext: EglBase.Context,
+        inpaintWatermarks: Boolean = true,
         onFirstFrame: () -> Unit,
         onResolutionChanged: ((Int, Int) -> Unit)? = null,
     ) {
@@ -48,7 +49,13 @@ class TextureViewRenderer(context: Context) : TextureView(context),
         this.onFirstFrame = onFirstFrame
         this.onResolutionChanged = onResolutionChanged
 
-        eglRenderer.init(eglContext, EglBase.CONFIG_PLAIN, GlRectDrawer())
+        val drawer: RendererCommon.GlDrawer = if (inpaintWatermarks) {
+            Log.i(TAG, "Using WatermarkInpaintDrawer (GPU Coons-patch watermark eraser ON)")
+            WatermarkInpaintDrawer()
+        } else {
+            GlRectDrawer()
+        }
+        eglRenderer.init(eglContext, EglBase.CONFIG_PLAIN, drawer)
         if (isAvailable && surfaceTexture != null) {
             eglRenderer.createEglSurface(surfaceTexture)
             eglRenderer.clearImage(0f, 0f, 0f, 1f)

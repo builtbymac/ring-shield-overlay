@@ -27,6 +27,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var cornerBtn: Button
     private lateinit var sizeBtn: Button
     private lateinit var durationBtn: Button
+    private lateinit var inpaintBtn: Button
     private lateinit var dotBtn: Button
     private lateinit var smoothBtn: Button
 
@@ -131,6 +132,9 @@ class MainActivity : AppCompatActivity() {
                 it.copy(overlayDurationSec = next)
             }
         }
+        inpaintBtn = tvButton("") {
+            updateConfig { it.copy(cropRingWatermark = !it.cropRingWatermark) }
+        }
         dotBtn = tvButton("") {
             updateConfig { it.copy(showLiveDot = !it.showLiveDot) }
         }
@@ -164,7 +168,7 @@ class MainActivity : AppCompatActivity() {
         root.addView(settingsHeader)
 
         val settingsGrid = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        listOf(cornerBtn, sizeBtn, durationBtn, dotBtn, smoothBtn, permBtn).forEach { btn ->
+        listOf(inpaintBtn, cornerBtn, sizeBtn, durationBtn, dotBtn, smoothBtn, permBtn).forEach { btn ->
             settingsGrid.addView(
                 btn,
                 LinearLayout.LayoutParams(dp(440), LinearLayout.LayoutParams.WRAP_CONTENT).apply {
@@ -227,14 +231,16 @@ class MainActivity : AppCompatActivity() {
             append("Remote Shortcut    : Map a Shield remote button to \"Doorbell PiP / Fullscreen\" (QuickToggleActivity)")
         }
 
+        inpaintBtn.text = "GPU Watermark Inpainter : ${if (cfg.cropRingWatermark) "ON (Erases Ring/Device-ID/UTC, 0% Crop)" else "OFF"}"
         cornerBtn.text = "Corner Position : ${cfg.corner.label}"
         sizeBtn.text = "PiP Overlay Size : ${cfg.overlayWidthPx}×${cfg.overlayHeightPx}"
         durationBtn.text = "Auto-Dismiss Duration : ${cfg.overlayDurationSec}s"
         dotBtn.text = "Subtle Red Live Dot : ${if (cfg.showLiveDot) "ON" else "OFF (Pure Video)"}"
         val smoothLabel = when (cfg.minPlayoutDelayMs) {
             0 -> "0 ms (Raw / Lowest Latency)"
-            350 -> "350 ms (Smooth — Recommended)"
-            else -> "${cfg.minPlayoutDelayMs} ms (Extra Smooth)"
+            200 -> "200 ms (Fast & Smooth — Recommended)"
+            350 -> "350 ms (Extra Cushion)"
+            else -> "${cfg.minPlayoutDelayMs} ms"
         }
         smoothBtn.text = "Jitter Smoothing Buffer : $smoothLabel"
     }
