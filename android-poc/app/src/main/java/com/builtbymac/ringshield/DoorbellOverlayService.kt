@@ -56,7 +56,7 @@ class DoorbellOverlayService : Service() {
         cfg = ConfigStore.load(this)
         latencyLogger = LatencyLogger(this)
         overlayManager = OverlayManager(this)
-        webrtc = WebRtcEngine(applicationContext, cfg.softwareDecoder)
+        webrtc = WebRtcEngine(applicationContext, cfg.softwareDecoder, cfg.minPlayoutDelayMs)
         relay = RelayClient(
             cfg = cfg,
             onEvent = { ev -> scope.launch { handleRelayEvent(ev) } },

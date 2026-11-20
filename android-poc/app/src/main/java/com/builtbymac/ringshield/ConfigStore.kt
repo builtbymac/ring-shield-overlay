@@ -20,9 +20,10 @@ data class PocConfig(
     val overlayHeightPx: Int = 360,
     val softwareDecoder: Boolean = false,
     val stripTwcc: Boolean = false,
-    val includeAudioTransceiver: Boolean = true,
+    val includeAudioTransceiver: Boolean = false,
     val iceGatherBudgetMs: Long = 1500L,
     val prewarmTtlMs: Long = 25_000L,
+    val minPlayoutDelayMs: Int = 350,
 )
 
 object ConfigStore {
@@ -54,9 +55,10 @@ object ConfigStore {
                 overlayHeightPx = json.optInt("overlayHeightPx", 360).coerceIn(135, 1080),
                 softwareDecoder = json.optBoolean("softwareDecoder", false),
                 stripTwcc = json.optBoolean("stripTwcc", false),
-                includeAudioTransceiver = json.optBoolean("includeAudioTransceiver", true),
+                includeAudioTransceiver = json.optBoolean("includeAudioTransceiver", false),
                 iceGatherBudgetMs = json.optLong("iceGatherBudgetMs", 1500L).coerceIn(50L, 5000L),
                 prewarmTtlMs = json.optLong("prewarmTtlMs", 25_000L).coerceIn(5_000L, 60_000L),
+                minPlayoutDelayMs = json.optInt("minPlayoutDelayMs", 350).coerceIn(0, 1500),
             )
         } catch (ex: Throwable) {
             Log.e(TAG, "Failed to parse ${file.absolutePath}: ${ex.message}")

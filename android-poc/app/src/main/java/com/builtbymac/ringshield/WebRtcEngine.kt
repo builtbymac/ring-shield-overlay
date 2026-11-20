@@ -41,6 +41,7 @@ data class PrewarmedOffer(
 class WebRtcEngine(
     private val context: Context,
     private val softwareDecoder: Boolean,
+    private val minPlayoutDelayMs: Int = 350,
 ) {
     val eglBase: EglBase = EglBase.create()
     private val audioDeviceModule = JavaAudioDeviceModule.builder(context)
@@ -55,8 +56,16 @@ class WebRtcEngine(
     private val factory: PeerConnectionFactory
 
     init {
+        val fieldTrials = if (minPlayoutDelayMs > 0) {
+            val maxMs = maxOf(minPlayoutDelayMs + 500, 1000)
+            "WebRTC-ForcePlayoutDelay/min_ms:$minPlayoutDelayMs,max_ms:$maxMs/"
+        } else {
+            ""
+        }
+        Log.i(TAG, "Initializing PeerConnectionFactory (fieldTrials='$fieldTrials')")
         PeerConnectionFactory.initialize(
             PeerConnectionFactory.InitializationOptions.builder(context)
+                .setFieldTrials(fieldTrials)
                 .setEnableInternalTracer(false)
                 .createInitializationOptions()
         )
