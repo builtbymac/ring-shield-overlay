@@ -104,7 +104,8 @@ class OverlayManager(private val context: Context) {
         isHiding = false
 
         val pip = computePipTransform(cfg)
-        currentCornerRadiusPx = if (startFullscreen) 0f else pip.unscaledCornerRadius
+        val exp = computeExpandedTransform()
+        currentCornerRadiusPx = if (startFullscreen) exp.unscaledCornerRadius else pip.unscaledCornerRadius
 
         val host = object : FrameLayout(context) {
             override fun dispatchKeyEvent(event: KeyEvent): Boolean {
@@ -188,10 +189,10 @@ class OverlayManager(private val context: Context) {
 
         // Pre-position card at exact target rect BEFORE adding window (stays alpha=0 until first frame)
         if (startFullscreen) {
-            card.scaleX = 1f
-            card.scaleY = 1f
-            card.translationX = 0f
-            card.translationY = 0f
+            card.scaleX = exp.scaleX
+            card.scaleY = exp.scaleY
+            card.translationX = exp.x
+            card.translationY = exp.y
         } else {
             card.scaleX = pip.scaleX
             card.scaleY = pip.scaleY
@@ -275,24 +276,25 @@ class OverlayManager(private val context: Context) {
             }
 
             val pip = computePipTransform(cfg)
+            val exp = computeExpandedTransform()
             card.pivotX = 0f
             card.pivotY = 0f
 
             if (expand) {
-                card.elevation = 0f
+                card.elevation = dp(24).toFloat()
                 scrim.animate()
-                    .alpha(0.95f)
+                    .alpha(EXPANDED_SCRIM_ALPHA)
                     .setDuration(380L)
                     .setInterpolator(morphEase)
                     .start()
 
-                animateCornerRadius(card, currentCornerRadiusPx, 0f, 400L)
+                animateCornerRadius(card, currentCornerRadiusPx, exp.unscaledCornerRadius, 400L)
 
                 card.animate()
-                    .scaleX(1f)
-                    .scaleY(1f)
-                    .translationX(0f)
-                    .translationY(0f)
+                    .scaleX(exp.scaleX)
+                    .scaleY(exp.scaleY)
+                    .translationX(exp.x)
+                    .translationY(exp.y)
                     .setDuration(420L)
                     .setInterpolator(morphEase)
                     .start()
@@ -342,12 +344,18 @@ class OverlayManager(private val context: Context) {
             video?.animate()?.alpha(0f)?.setDuration(240L)?.setInterpolator(exitEase)?.start()
 
             if (isFullscreen) {
-                card.pivotX = screenW / 2f
-                card.pivotY = screenH / 2f
+                val exp = computeExpandedTransform()
+                val shrinkScale = exp.scaleX * 0.95f
+                val shrinkX = (screenW - screenW * shrinkScale) / 2f
+                val shrinkY = (screenH - screenH * shrinkScale) / 2f + dp(12)
+                card.pivotX = 0f
+                card.pivotY = 0f
                 card.animate()
                     .alpha(0f)
-                    .scaleX(0.95f)
-                    .scaleY(0.95f)
+                    .scaleX(shrinkScale)
+                    .scaleY(shrinkScale)
+                    .translationX(shrinkX)
+                    .translationY(shrinkY)
                     .setDuration(260L)
                     .setInterpolator(exitEase)
                     .withEndAction {
@@ -419,24 +427,30 @@ class OverlayManager(private val context: Context) {
     ) {
         val cfg = currentCfg ?: return
         if (fullscreen) {
-            card.elevation = 0f
+            val exp = computeExpandedTransform()
+            val startScale = exp.scaleX * 0.94f
+            val startX = (screenW - screenW * startScale) / 2f
+            val startY = (screenH - screenH * startScale) / 2f + dp(16)
+            card.elevation = dp(24).toFloat()
             scrim.alpha = 0f
-            scrim.animate().alpha(0.95f).setDuration(320L).setInterpolator(enterEase).start()
+            scrim.animate().alpha(EXPANDED_SCRIM_ALPHA).setDuration(320L).setInterpolator(enterEase).start()
 
-            card.pivotX = screenW / 2f
-            card.pivotY = screenH / 2f
-            card.translationX = 0f
-            card.translationY = 0f
-            card.scaleX = 0.95f
-            card.scaleY = 0.95f
+            card.pivotX = 0f
+            card.pivotY = 0f
+            card.translationX = startX
+            card.translationY = startY
+            card.scaleX = startScale
+            card.scaleY = startScale
             card.alpha = 0f
             videoView.alpha = 0f
             videoView.animate().alpha(1f).setDuration(320L).setInterpolator(enterEase).start()
             card.animate()
                 .alpha(1f)
-                .scaleX(1f)
-                .scaleY(1f)
-                .setDuration(340L)
+                .translationX(exp.x)
+                .translationY(exp.y)
+                .scaleX(exp.scaleX)
+                .scaleY(exp.scaleY)
+                .setDuration(360L)
                 .setInterpolator(enterEase)
                 .start()
             return
@@ -546,6 +560,23 @@ class OverlayManager(private val context: Context) {
         )
     }
 
+    /**
+     * Expanded "theater card" transform: 88% of screen centered with lush rounded corners
+     * floating over the dimmed background scrim so it keeps the sleek rounded PiP aesthetic.
+     */
+    private fun computeExpandedTransform(): PipTransform {
+        val s = EXPANDED_SCREEN_FRACTION
+        val x = (screenW - screenW * s) / 2f
+        val y = (screenH - screenH * s) / 2f
+        return PipTransform(
+            x = x,
+            y = y,
+            scaleX = s,
+            scaleY = s,
+            unscaledCornerRadius = EXPANDED_VISUAL_CORNER_RADIUS_PX / s,
+        )
+    }
+
     private fun edgeSlideDeltaPx(cfg: PocConfig): Float {
         val isLeft = cfg.corner == OverlayCorner.TOP_LEFT || cfg.corner == OverlayCorner.BOTTOM_LEFT
         val delta = dp(48).toFloat()
@@ -580,6 +611,9 @@ class OverlayManager(private val context: Context) {
     companion object {
         private const val TAG = "OverlayManager"
         private const val PIP_VISUAL_CORNER_RADIUS_PX = 20f
+        private const val EXPANDED_VISUAL_CORNER_RADIUS_PX = 28f
+        private const val EXPANDED_SCREEN_FRACTION = 0.88f
+        private const val EXPANDED_SCRIM_ALPHA = 0.76f
         private const val PIP_MARGIN_DP = 24
         private const val KEEP_ALIVE_SAFETY_CAP_MS = 5 * 60 * 1000L
     }
