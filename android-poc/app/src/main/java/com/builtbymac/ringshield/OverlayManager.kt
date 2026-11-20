@@ -142,7 +142,7 @@ class OverlayManager(private val context: Context) {
         )
 
         val card = FrameLayout(context).apply {
-            setBackgroundColor(Color.BLACK)
+            setBackgroundColor(Color.TRANSPARENT)
             alpha = 0f
             pivotX = 0f
             pivotY = 0f
