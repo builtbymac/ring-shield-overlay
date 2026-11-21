@@ -285,26 +285,22 @@ class OverlayManager(private val context: Context) {
 
         host.addView(card, FrameLayout.LayoutParams(cardBaseW, cardBaseH, Gravity.TOP or Gravity.START))
 
-        // In Corner PiP mode, size the overlay window tightly around the PiP card (instead of full
-        // 1920x1080) so Skia's Stencil/RenderTarget & Nvidia HWC 4K HDR composition stay ~6x lighter.
-        val winRect = if (startFullscreen) {
-            android.graphics.Rect(0, 0, screenW, screenH)
-        } else {
-            computePipWindowRect(cfg, pip)
-        }
-        hostOffsetX = winRect.left.toFloat()
-        hostOffsetY = winRect.top.toFloat()
+        // Always keep the host window full-screen so WindowManager/SurfaceFlinger never
+        // reallocates the overlay Surface mid-animation during PiP <-> Fullscreen transitions
+        // (while cardBaseW/H = 1280x720 keeps TextureView & GPU shader work 2.25x lighter).
+        hostOffsetX = 0f
+        hostOffsetY = 0f
 
         val params = WindowManager.LayoutParams(
-            winRect.width(),
-            winRect.height(),
+            screenW,
+            screenH,
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
             flagsForOverlay(),
             PixelFormat.TRANSLUCENT,
         ).apply {
             gravity = Gravity.TOP or Gravity.START
-            x = winRect.left
-            y = winRect.top
+            x = 0
+            y = 0
             title = "ring-shield-overlay"
         }
 
@@ -527,9 +523,6 @@ class OverlayManager(private val context: Context) {
             card.pivotY = 0f
 
             if (expand) {
-                // Expand window bounds to full screen before morphing PiP -> Fullscreen
-                applyHostWindowBounds(fullscreenBounds = true)
-
                 // 1. Cleanly dismiss PiP dock immediately before card grows (prevents scale distortion)
                 isPipHovered = false
                 pipFocusTarget = PipFocusTarget.CARD
@@ -539,7 +532,7 @@ class OverlayManager(private val context: Context) {
                     if (dock.visibility == View.VISIBLE) {
                         dock.animate()
                             .alpha(0f)
-                            .setDuration(80L)
+                            .setDuration(70L)
                             .setInterpolator(exitEase)
                             .withEndAction {
                                 if (isFullscreen) {
@@ -563,7 +556,7 @@ class OverlayManager(private val context: Context) {
                     dock.animate()
                         .alpha(1f)
                         .translationY(0f)
-                        .setStartDelay(150L)
+                        .setStartDelay(180L)
                         .setDuration(220L)
                         .setInterpolator(enterEase)
                         .start()
@@ -576,14 +569,14 @@ class OverlayManager(private val context: Context) {
                 }
 
                 card.elevation = 0f
-                animateCornerRadius(card, currentCornerRadiusPx, exp.unscaledCornerRadius, 400L)
+                animateCornerRadius(card, currentCornerRadiusPx, exp.unscaledCornerRadius, 380L)
 
                 card.animate()
                     .scaleX(exp.scaleX)
                     .scaleY(exp.scaleY)
                     .translationX(exp.x - hostOffsetX)
                     .translationY(exp.y - hostOffsetY)
-                    .setDuration(400L)
+                    .setDuration(380L)
                     .setInterpolator(morphEase)
                     .start()
             } else {
@@ -593,7 +586,7 @@ class OverlayManager(private val context: Context) {
                     dock.animate()
                         .alpha(0f)
                         .setStartDelay(0L)
-                        .setDuration(85L)
+                        .setDuration(75L)
                         .setInterpolator(exitEase)
                         .withEndAction {
                             if (!isFullscreen) {
@@ -618,24 +611,19 @@ class OverlayManager(private val context: Context) {
 
                 glassRimView?.apply {
                     animate().cancel()
-                    animate().alpha(0f).setDuration(160L).start()
+                    animate().alpha(0f).setDuration(150L).start()
                 }
 
                 card.elevation = 0f
-                animateCornerRadius(card, currentCornerRadiusPx, pip.unscaledCornerRadius, 360L)
+                animateCornerRadius(card, currentCornerRadiusPx, pip.unscaledCornerRadius, 350L)
 
                 card.animate()
                     .scaleX(pip.scaleX)
                     .scaleY(pip.scaleY)
                     .translationX(pip.x - hostOffsetX)
                     .translationY(pip.y - hostOffsetY)
-                    .setDuration(360L)
+                    .setDuration(350L)
                     .setInterpolator(morphEase)
-                    .withEndAction {
-                        if (!isFullscreen && !isHiding) {
-                            applyHostWindowBounds(fullscreenBounds = false)
-                        }
-                    }
                     .start()
             }
         }
@@ -1857,8 +1845,8 @@ class OverlayManager(private val context: Context) {
             addUpdateListener { anim ->
                 val v = anim.animatedValue as Float
                 val isFinal = anim.animatedFraction >= 0.999f
-                // Avoid rebuilding the 1920x1080 clip outline & rim gradient for tiny sub-pixel deltas
-                if (isFinal || kotlin.math.abs(v - lastApplied) >= 3.0f) {
+                // Keep corner-radius morph silky while skipping invisible sub-pixel invalidations
+                if (isFinal || kotlin.math.abs(v - lastApplied) >= 0.6f) {
                     lastApplied = v
                     currentCornerRadiusPx = v
                     card.invalidateOutline()
@@ -1942,46 +1930,6 @@ class OverlayManager(private val context: Context) {
             scaleY = sy,
             unscaledCornerRadius = EXPANDED_VISUAL_CORNER_RADIUS_PX / sx.coerceAtLeast(0.5f),
         )
-    }
-
-    private fun computePipWindowRect(cfg: PocConfig, pip: PipTransform): android.graphics.Rect {
-        val padH = dp(56)
-        val padV = dp(28)
-        val left = (pip.x.toInt() - padH).coerceAtLeast(0)
-        val top = (pip.y.toInt() - padV).coerceAtLeast(0)
-        val right = (pip.x.toInt() + cfg.overlayWidthPx + padH).coerceAtMost(screenW)
-        val bottom = (pip.y.toInt() + cfg.overlayHeightPx + padV).coerceAtMost(screenH)
-        return android.graphics.Rect(left, top, right, bottom)
-    }
-
-    private fun applyHostWindowBounds(fullscreenBounds: Boolean) {
-        val host = hostWindow ?: return
-        val card = cardView ?: return
-        val params = rootParams ?: return
-        val cfg = currentCfg ?: return
-        val target = if (fullscreenBounds) {
-            android.graphics.Rect(0, 0, screenW, screenH)
-        } else {
-            computePipWindowRect(cfg, computePipTransform(cfg))
-        }
-        if (params.x == target.left &&
-            params.y == target.top &&
-            params.width == target.width() &&
-            params.height == target.height()
-        ) {
-            return
-        }
-        val oldOffsetX = hostOffsetX
-        val oldOffsetY = hostOffsetY
-        hostOffsetX = target.left.toFloat()
-        hostOffsetY = target.top.toFloat()
-        card.translationX += (oldOffsetX - hostOffsetX)
-        card.translationY += (oldOffsetY - hostOffsetY)
-        params.x = target.left
-        params.y = target.top
-        params.width = target.width()
-        params.height = target.height()
-        runCatching { wm.updateViewLayout(host, params) }
     }
 
     private fun edgeSlideDeltaPx(cfg: PocConfig): Float {
