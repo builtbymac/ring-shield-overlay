@@ -126,7 +126,7 @@ object WatermarkInpaintDrawerFactory {
             }
         }
 
-        val callbacks = object : ShaderCallbacks {
+        val callbacks = object : GlGenericDrawer.ShaderCallbacks {
             override fun onNewShader(shader: GlShader) {
                 ensureLutTexturesLoaded()
                 locLut0 = shader.getUniformLocation("u_wm_lut0")
