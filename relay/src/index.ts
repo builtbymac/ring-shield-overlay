@@ -1,3 +1,4 @@
+import { execFile } from 'node:child_process'
 import http from 'node:http'
 import { AccountLinker } from './accountLink.js'
 import { loadConfig } from './config.js'
@@ -50,6 +51,41 @@ function checkLanAuth(req: http.IncomingMessage, lanToken?: string): boolean {
   if (!lanToken) return true
   const auth = req.headers.authorization?.replace(/^Bearer\s+/i, '').trim()
   return auth === lanToken
+}
+
+const ADB_BIN =
+  process.env.ADB_PATH || 'C:\\Users\\alexm\\AppData\\Local\\Android\\Sdk\\platform-tools\\adb.exe'
+const SHIELD_SERIAL = process.env.SHIELD_ADB_SERIAL || '192.168.50.130:5555'
+const mutedLiveTvPackages = new Set<string>()
+
+function setShieldPackageAudioMute(pkg: string, muted: boolean): Promise<void> {
+  if (!/^[a-zA-Z0-9_.]+$/.test(pkg) || pkg === 'com.builtbymac.ringshield') {
+    return Promise.resolve()
+  }
+  const mode = muted ? 'ignore' : 'allow'
+  if (muted) mutedLiveTvPackages.add(pkg)
+  else mutedLiveTvPackages.delete(pkg)
+  return new Promise((resolve) => {
+    execFile(
+      ADB_BIN,
+      ['-s', SHIELD_SERIAL, 'shell', 'appops', 'set', pkg, 'PLAY_AUDIO', mode],
+      { timeout: 3000 },
+      (err) => {
+        if (err) {
+          console.warn(`[audio] appops set ${pkg} PLAY_AUDIO ${mode} failed: ${err.message}`)
+        } else {
+          console.log(`[audio] Set Live TV package ${pkg} PLAY_AUDIO -> ${mode}`)
+        }
+        resolve()
+      },
+    )
+  })
+}
+
+async function restoreAllMutedLiveTvPackages(): Promise<void> {
+  for (const pkg of Array.from(mutedLiveTvPackages)) {
+    await setShieldPackageAudioMute(pkg, false)
+  }
 }
 
 async function main(): Promise<void> {
@@ -247,6 +283,22 @@ async function main(): Promise<void> {
         return
       }
 
+      // Per-package Live TV audio mute via Android AppOps PLAY_AUDIO (mutes only Live TV, never pauses video or mutes Doorbell)
+      if (method === 'POST' && url.pathname === '/api/audio/app-mute') {
+        const rawBody = await readRawBody(req)
+        const { packageName, muted } = JSON.parse(rawBody.toString('utf8')) as {
+          packageName?: string
+          muted?: boolean
+        }
+        if (packageName) {
+          await setShieldPackageAudioMute(packageName, Boolean(muted))
+        } else if (!muted) {
+          await restoreAllMutedLiveTvPackages()
+        }
+        sendJson(res, 200, { ok: true, packageName, muted: Boolean(muted) })
+        return
+      }
+
       // WHEP Start Proxy: Shield sends SDP offer -> Relay forwards to api.amazonvision.com
       if (method === 'POST' && url.pathname === '/api/whep/start') {
         const rawBody = await readRawBody(req)
@@ -270,6 +322,7 @@ async function main(): Promise<void> {
       if (method === 'DELETE' && url.pathname === '/api/whep/stop') {
         const rawBody = await readRawBody(req)
         const { sessionUrl } = JSON.parse(rawBody.toString('utf8')) as { sessionUrl?: string }
+        await restoreAllMutedLiveTvPackages()
         if (!sessionUrl) {
           sendJson(res, 400, { error: 'Missing sessionUrl' })
           return

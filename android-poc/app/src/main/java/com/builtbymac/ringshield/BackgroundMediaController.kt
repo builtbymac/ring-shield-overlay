@@ -13,23 +13,28 @@ import android.util.Log
 import android.view.KeyEvent
 
 /**
- * Context-aware background media controller for Nvidia Shield Pro when Doorbell Audio is toggled:
+ * Context-aware background media controller for Nvidia Shield Pro when Doorbell Audio is toggled.
+ *
+ * NOTE: Nvidia Shield Pro uses `mIsSingleVolume = true`, meaning `adjustStreamVolume(STREAM_MUSIC, ADJUST_MUTE)`
+ * mutes the entire HDMI audio output across ALL streams (including our own WebRTC audio). Therefore we
+ * NEVER mute `STREAM_MUSIC` globally; instead:
  *
  *  1. Live TV Context (e.g. TiviMate `ar.tvplayer.tv`, Live Channels):
- *     - Mutes `STREAM_MUSIC` internally (`adjustStreamVolume(STREAM_MUSIC, ADJUST_MUTE, 0)`)
- *       WITHOUT requesting transient audio focus or sending `KEYCODE_MEDIA_PAUSE`, so Live TV
- *       video keeps playing smoothly in the background while doorbell audio plays on
- *       `USAGE_ASSISTANCE_ACCESSIBILITY` (`STREAM_ACCESSIBILITY`, exempt from `STREAM_MUSIC` mute).
- *     - On audio toggle OFF or overlay dismiss: unmutes `STREAM_MUSIC` (`ADJUST_UNMUTE`).
+ *     - Mutes ONLY the Live TV package at the OS `AudioFlinger` level (`appops set <pkg> PLAY_AUDIO ignore`
+ *       via the relay + `AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK` with `setWillPauseWhenDucked(false)`), so
+ *       Live TV video keeps playing at 60 fps without pausing while Doorbell audio plays at full HDMI volume.
+ *     - On audio toggle OFF or overlay dismiss: restores `PLAY_AUDIO allow` on the Live TV package.
  *
  *  2. Not-Live / VOD Context (Films, YouTube, Netflix, Stremio, Prime Video, Nuvio, iPlayer, etc.):
  *     - Requests `AUDIOFOCUS_GAIN_TRANSIENT` AND dispatches `KEYCODE_MEDIA_PAUSE` so the watching
- *       film/video pauses while doorbell audio plays (also muting `STREAM_MUSIC` while active so
- *       no residual audio bleeds through).
- *     - On audio toggle OFF or overlay dismiss: unmutes `STREAM_MUSIC`, abandons audio focus, and
- *       dispatches `KEYCODE_MEDIA_PLAY` if media was actively playing before we paused it.
+ *       film/video pauses immediately while Doorbell audio plays at full HDMI volume.
+ *     - On audio toggle OFF or overlay dismiss: abandons audio focus and dispatches `KEYCODE_MEDIA_PLAY`
+ *       if media was actively playing before we paused it.
  */
-class BackgroundMediaController(private val context: Context) {
+class BackgroundMediaController(
+    private val context: Context,
+    private val onPerAppLiveTvMute: (packageName: String?, muted: Boolean) -> Unit,
+) {
 
     enum class MediaMode {
         NONE,
@@ -41,40 +46,54 @@ class BackgroundMediaController(private val context: Context) {
     private val mainHandler = Handler(Looper.getMainLooper())
 
     private var activeMode: MediaMode = MediaMode.NONE
-    private var wasStreamMusicMutedBefore: Boolean = false
+    private var activeLiveTvPkg: String? = null
     private var wasMediaPlayingBefore: Boolean = false
     private var activeFocusRequest: AudioFocusRequest? = null
 
     fun onDoorbellAudioEnabled() {
         if (activeMode != MediaMode.NONE) return
 
+        // Ensure master HDMI output is never globally muted
+        runCatching {
+            if (audioManager.isStreamMute(AudioManager.STREAM_MUSIC)) {
+                audioManager.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_UNMUTE, 0)
+            }
+        }
+
         val fgPkg = detectForegroundPackage()
         val isLiveTv = fgPkg != null && LIVE_TV_PACKAGES.contains(fgPkg)
-        wasStreamMusicMutedBefore = runCatching {
-            audioManager.isStreamMute(AudioManager.STREAM_MUSIC)
-        }.getOrDefault(false)
         wasMediaPlayingBefore = runCatching { audioManager.isMusicActive }.getOrDefault(false)
 
         Log.i(
             TAG,
             "Enabling doorbell audio: foregroundPkg=${fgPkg ?: "unknown"}, isLiveTv=$isLiveTv, " +
-                "wasMusicActive=$wasMediaPlayingBefore, wasMuted=$wasStreamMusicMutedBefore"
+                "wasMusicActive=$wasMediaPlayingBefore"
         )
 
         if (isLiveTv) {
             activeMode = MediaMode.LIVE_TV_MUTED
-            // Mute STREAM_MUSIC internally (flags=0 -> no UI toast, no pausing Live TV video)
-            if (!wasStreamMusicMutedBefore) {
-                runCatching {
-                    audioManager.adjustStreamVolume(
-                        AudioManager.STREAM_MUSIC,
-                        AudioManager.ADJUST_MUTE,
-                        0,
+            activeLiveTvPkg = fgPkg
+            // 1. Mute ONLY the Live TV package in AudioFlinger (PLAY_AUDIO ignore) so video never pauses
+            onPerAppLiveTvMute(fgPkg, true)
+
+            // 2. Also request non-pausing duck focus as a native fallback
+            runCatching {
+                val req = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
+                    .setAudioAttributes(
+                        AudioAttributes.Builder()
+                            .setUsage(AudioAttributes.USAGE_ASSISTANCE_NAVIGATION_GUIDANCE)
+                            .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                            .build()
                     )
-                }.onFailure { Log.w(TAG, "adjustStreamVolume(ADJUST_MUTE) failed: ${it.message}") }
-            }
+                    .setWillPauseWhenDucked(false)
+                    .setOnAudioFocusChangeListener { /* no-op */ }
+                    .build()
+                activeFocusRequest = req
+                audioManager.requestAudioFocus(req)
+            }.onFailure { Log.w(TAG, "requestAudioFocus(MAY_DUCK) failed: ${it.message}") }
         } else {
             activeMode = MediaMode.VOD_PAUSED
+            activeLiveTvPkg = null
             // 1. Request transient audio focus so standard Android TV VOD players pause
             runCatching {
                 val req = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT)
@@ -88,22 +107,11 @@ class BackgroundMediaController(private val context: Context) {
                     .build()
                 activeFocusRequest = req
                 audioManager.requestAudioFocus(req)
-            }.onFailure { Log.w(TAG, "requestAudioFocus failed: ${it.message}") }
+            }.onFailure { Log.w(TAG, "requestAudioFocus(TRANSIENT) failed: ${it.message}") }
 
             // 2. Dispatch explicit idempotent KEYCODE_MEDIA_PAUSE for players that ignore focus loss
             if (wasMediaPlayingBefore) {
                 dispatchMediaKey(KeyEvent.KEYCODE_MEDIA_PAUSE)
-            }
-
-            // 3. Also silence STREAM_MUSIC while doorbell audio is active so no transition bleed occurs
-            if (!wasStreamMusicMutedBefore) {
-                runCatching {
-                    audioManager.adjustStreamVolume(
-                        AudioManager.STREAM_MUSIC,
-                        AudioManager.ADJUST_MUTE,
-                        0,
-                    )
-                }
             }
         }
     }
@@ -115,33 +123,29 @@ class BackgroundMediaController(private val context: Context) {
 
         Log.i(TAG, "Disabling doorbell audio (restoring mode=$mode)")
 
-        // 1. Unmute STREAM_MUSIC if it wasn't muted before we started
-        if (!wasStreamMusicMutedBefore) {
-            runCatching {
-                audioManager.adjustStreamVolume(
-                    AudioManager.STREAM_MUSIC,
-                    AudioManager.ADJUST_UNMUTE,
-                    0,
-                )
-            }.onFailure { Log.w(TAG, "adjustStreamVolume(ADJUST_UNMUTE) failed: ${it.message}") }
+        activeFocusRequest?.let { req ->
+            runCatching { audioManager.abandonAudioFocusRequest(req) }
         }
+        activeFocusRequest = null
 
-        // 2. If we paused VOD media, abandon audio focus and resume playback
-        if (mode == MediaMode.VOD_PAUSED) {
-            activeFocusRequest?.let { req ->
-                runCatching { audioManager.abandonAudioFocusRequest(req) }
+        when (mode) {
+            MediaMode.LIVE_TV_MUTED -> {
+                val pkg = activeLiveTvPkg
+                activeLiveTvPkg = null
+                onPerAppLiveTvMute(pkg, false)
             }
-            activeFocusRequest = null
-
-            if (wasMediaPlayingBefore) {
-                val shouldResume = wasMediaPlayingBefore
-                wasMediaPlayingBefore = false
-                mainHandler.postDelayed({
-                    if (activeMode == MediaMode.NONE && shouldResume) {
-                        dispatchMediaKey(KeyEvent.KEYCODE_MEDIA_PLAY)
-                    }
-                }, 160L)
+            MediaMode.VOD_PAUSED -> {
+                if (wasMediaPlayingBefore) {
+                    val shouldResume = wasMediaPlayingBefore
+                    wasMediaPlayingBefore = false
+                    mainHandler.postDelayed({
+                        if (activeMode == MediaMode.NONE && shouldResume) {
+                            dispatchMediaKey(KeyEvent.KEYCODE_MEDIA_PLAY)
+                        }
+                    }, 160L)
+                }
             }
+            MediaMode.NONE -> Unit
         }
     }
 

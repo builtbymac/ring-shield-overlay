@@ -143,6 +143,21 @@ class RelayClient(
         }.onFailure { Log.w(TAG, "WHEP stop failed: ${it.message}") }
     }
 
+    suspend fun setAppAudioMute(packageName: String?, muted: Boolean) = withContext(Dispatchers.IO) {
+        val payload = JSONObject().apply {
+            if (!packageName.isNullOrBlank()) put("packageName", packageName)
+            put("muted", muted)
+        }.toString()
+        val reqBuilder = Request.Builder()
+            .url("${cfg.relayUrl}/api/audio/app-mute")
+            .post(payload.toRequestBody(JSON_MEDIA_TYPE))
+        cfg.lanToken?.let { reqBuilder.header("Authorization", "Bearer $it") }
+
+        runCatching {
+            http.newCall(reqBuilder.build()).execute().use { /* per-package PLAY_AUDIO mute */ }
+        }.onFailure { Log.w(TAG, "setAppAudioMute failed: ${it.message}") }
+    }
+
     fun close() {
         stopped = true
         ws?.close(1000, "service_stopped")

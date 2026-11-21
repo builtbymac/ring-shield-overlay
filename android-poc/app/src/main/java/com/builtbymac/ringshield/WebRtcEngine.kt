@@ -50,9 +50,10 @@ class WebRtcEngine(
     private val audioDeviceModule = JavaAudioDeviceModule.builder(context)
         .setUseHardwareAcousticEchoCanceler(false)
         .setUseHardwareNoiseSuppressor(false)
+        .setUseLowLatency(true)
         .setAudioAttributes(
             AudioAttributes.Builder()
-                .setUsage(AudioAttributes.USAGE_ASSISTANCE_ACCESSIBILITY)
+                .setUsage(AudioAttributes.USAGE_MEDIA)
                 .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                 .build()
         )
@@ -101,7 +102,7 @@ class WebRtcEngine(
         val audioTrackDeferred = CompletableDeferred<AudioTrack>()
         val iceConnectedDeferred = CompletableDeferred<Long>()
         val srflxOrComplete = CompletableDeferred<Unit>()
-        val expectedSrflx = if (cfg.includeAudioTransceiver) 2 else 1
+        val expectedSrflx = 1
         val srflxCount = java.util.concurrent.atomic.AtomicInteger(0)
 
         val iceServers = listOf(
@@ -111,7 +112,7 @@ class WebRtcEngine(
         )
         val rtcConfig = PeerConnection.RTCConfiguration(iceServers).apply {
             sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN
-            bundlePolicy = PeerConnection.BundlePolicy.BALANCED
+            bundlePolicy = PeerConnection.BundlePolicy.MAX_BUNDLE
             continualGatheringPolicy = PeerConnection.ContinualGatheringPolicy.GATHER_ONCE
         }
 
@@ -216,9 +217,12 @@ class WebRtcEngine(
     }
 
     fun setDoorbellAudioEnabled(track: AudioTrack?, enabled: Boolean) {
-        runCatching { track?.setEnabled(enabled) }
+        runCatching {
+            track?.setEnabled(enabled)
+            track?.setVolume(if (enabled) 5.0 else 0.0)
+        }
         runCatching { audioDeviceModule.setSpeakerMute(!enabled) }
-        Log.i(TAG, "Doorbell WebRTC audio playout -> ${if (enabled) "ENABLED" else "MUTED"}")
+        Log.i(TAG, "Doorbell WebRTC audio playout -> ${if (enabled) "ENABLED (vol=5.0x)" else "MUTED"}")
     }
 
     fun closeOffer(offer: PrewarmedOffer?) {

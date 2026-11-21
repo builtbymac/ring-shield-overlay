@@ -61,7 +61,6 @@ class DoorbellOverlayService : Service() {
         cfg = ConfigStore.load(this)
         latencyLogger = LatencyLogger(this)
         overlayManager = OverlayManager(this)
-        backgroundMediaCtrl = BackgroundMediaController(this)
         webrtc = WebRtcEngine(applicationContext, cfg.softwareDecoder, cfg.minPlayoutDelayMs)
         relay = RelayClient(
             cfg = cfg,
@@ -77,6 +76,9 @@ class DoorbellOverlayService : Service() {
                 }
             }
         )
+        backgroundMediaCtrl = BackgroundMediaController(this) { pkg, muted ->
+            scope.launch { relay.setAppAudioMute(pkg, muted) }
+        }
 
         registerNetworkWatcher()
         relay.connect()
@@ -343,24 +345,36 @@ class DoorbellOverlayService : Service() {
                     if (activeOffer !== offer) return@repeat
                     offer.peerConnection.getStats { report ->
                         report.statsMap.values
-                            .filter { it.type == "inbound-rtp" && it.members["kind"] == "video" }
+                            .filter { it.type == "inbound-rtp" }
                             .forEach { s ->
+                                val kind = s.members["kind"]
                                 val jbDelay = (s.members["jitterBufferDelay"] as? Number)?.toDouble()
                                 val jbEmitted = (s.members["jitterBufferEmittedCount"] as? Number)?.toDouble()
                                 val avgJbMs = if (jbDelay != null && jbEmitted != null && jbEmitted > 0) {
                                     "%.1f".format((jbDelay / jbEmitted) * 1000.0)
                                 } else "n/a"
                                 val jitterMs = (s.members["jitter"] as? Number)?.toDouble()?.let { "%.1f".format(it * 1000.0) } ?: "n/a"
-                                Log.i(
-                                    TAG,
-                                    "RTC stats[#${sampleIdx + 1}]: " +
-                                        "${s.members["frameWidth"]}x${s.members["frameHeight"]}@${s.members["framesPerSecond"]}fps " +
-                                        "dec=${s.members["framesDecoded"]} drop=${s.members["framesDropped"]} " +
-                                        "freezes=${s.members["freezeCount"]}(${s.members["totalFreezesDuration"]}s) " +
-                                        "pkts=${s.members["packetsReceived"]} lost=${s.members["packetsLost"]} " +
-                                        "nack=${s.members["nackCount"]} pli=${s.members["pliCount"]} " +
-                                        "jitter=${jitterMs}ms jb=${avgJbMs}ms impl=${s.members["decoderImplementation"]}"
-                                )
+                                if (kind == "video") {
+                                    Log.i(
+                                        TAG,
+                                        "RTC stats[#${sampleIdx + 1}]: " +
+                                            "${s.members["frameWidth"]}x${s.members["frameHeight"]}@${s.members["framesPerSecond"]}fps " +
+                                            "dec=${s.members["framesDecoded"]} drop=${s.members["framesDropped"]} " +
+                                            "freezes=${s.members["freezeCount"]}(${s.members["totalFreezesDuration"]}s) " +
+                                            "pkts=${s.members["packetsReceived"]} lost=${s.members["packetsLost"]} " +
+                                            "nack=${s.members["nackCount"]} pli=${s.members["pliCount"]} " +
+                                            "jitter=${jitterMs}ms jb=${avgJbMs}ms impl=${s.members["decoderImplementation"]}"
+                                    )
+                                } else if (kind == "audio") {
+                                    Log.i(
+                                        TAG,
+                                        "RTC AUDIO stats[#${sampleIdx + 1}]: " +
+                                            "pkts=${s.members["packetsReceived"]} bytes=${s.members["bytesReceived"]} " +
+                                            "lost=${s.members["packetsLost"]} samples=${s.members["totalSamplesReceived"]} " +
+                                            "level=${s.members["audioLevel"]} energy=${s.members["totalAudioEnergy"]} " +
+                                            "jitter=${jitterMs}ms jb=${avgJbMs}ms"
+                                    )
+                                }
                             }
                     }
                 }
