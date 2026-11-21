@@ -1,6 +1,7 @@
 import { execFile } from 'node:child_process'
 import http from 'node:http'
 import { AccountLinker } from './accountLink.js'
+import { AlexaHueBridge } from './alexaHue.js'
 import { loadConfig } from './config.js'
 import { RingAuthManager } from './ringAuth.js'
 import {
@@ -367,6 +368,16 @@ async function main(): Promise<void> {
 
   const hub = new ShieldWsHub(server, cfg.lanToken)
 
+  const alexaHueEnabled = process.env.ALEXA_HUE_ENABLED !== 'false'
+  const alexaHuePort = Number.parseInt(process.env.ALEXA_HUE_PORT || '80', 10)
+  const alexaHue = alexaHueEnabled
+    ? new AlexaHueBridge({
+        port: Number.isFinite(alexaHuePort) ? alexaHuePort : 80,
+        hostIp: process.env.ALEXA_HUE_HOST_IP,
+        hub,
+      })
+    : null
+
   await auth.warm()
 
   server.listen(cfg.port, cfg.host, () => {
@@ -374,10 +385,14 @@ async function main(): Promise<void> {
       `[relay] Listening on http://${cfg.host}:${cfg.port} (authMode=${auth.mode}, defaultDevice=${cfg.defaultDeviceId ?? 'auto'})`,
     )
     void connectShieldAdb()
+    if (alexaHue) {
+      void alexaHue.start()
+    }
   })
 
   const shutdown = () => {
     console.log('[relay] Shutting down...')
+    alexaHue?.stop()
     auth.stop()
     hub.close()
     server.close(() => process.exit(0))

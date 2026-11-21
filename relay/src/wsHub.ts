@@ -3,6 +3,8 @@ import { WebSocketServer, WebSocket } from 'ws'
 import type { Server } from 'node:http'
 import type { NormalizedRingEvent } from './webhook.js'
 
+export type OverlayCommandAction = 'show' | 'fullscreen' | 'toggle_fullscreen' | 'dismiss'
+
 interface AliveSocket extends WebSocket {
   isAlive?: boolean
   clientId?: string
