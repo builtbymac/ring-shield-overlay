@@ -54,7 +54,10 @@ function checkLanAuth(req: http.IncomingMessage, lanToken?: string): boolean {
 }
 
 const ADB_BIN =
-  process.env.ADB_PATH || 'C:\\Users\\alexm\\AppData\\Local\\Android\\Sdk\\platform-tools\\adb.exe'
+  process.env.ADB_PATH ||
+  (process.platform === 'win32'
+    ? 'C:\\Users\\alexm\\AppData\\Local\\Android\\Sdk\\platform-tools\\adb.exe'
+    : 'adb')
 const SHIELD_SERIAL = process.env.SHIELD_ADB_SERIAL || '192.168.50.130:5555'
 const mutedLiveTvPackages = new Set<string>()
 
