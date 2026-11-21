@@ -3,6 +3,7 @@ package com.builtbymac.ringshield
 import android.animation.ObjectAnimator
 import android.animation.ValueAnimator
 import android.content.Context
+import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.LinearGradient
@@ -18,19 +19,23 @@ import android.graphics.drawable.GradientDrawable
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.provider.Settings
 import android.util.DisplayMetrics
 import android.util.Log
 import android.util.TypedValue
+import android.view.Choreographer
 import android.view.Gravity
 import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewOutlineProvider
 import android.view.WindowManager
+import android.view.animation.LinearInterpolator
 import android.view.animation.OvershootInterpolator
 import android.view.animation.PathInterpolator
 import android.widget.FrameLayout
+import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.TextView
 import org.webrtc.EglBase
@@ -88,8 +93,28 @@ class OverlayManager(private val context: Context) {
     private var screenH: Int = 1080
     private var currentCornerRadiusPx: Float = 0f
 
+    private var connectingBackdrop: FrameLayout? = null
+    private var connectingPreviewImage: ImageView? = null
     private var connectingContainer: View? = null
-    private var connectingPulseAnimator: ObjectAnimator? = null
+    private var connectingPulseAnimator: ValueAnimator? = null
+    private var hasFirstFrame: Boolean = false
+
+    private var glassSyncUntilMs: Long = 0L
+    private var glassSyncRunning: Boolean = false
+    private val glassSyncFrameCallback = object : Choreographer.FrameCallback {
+        override fun doFrame(frameTimeNanos: Long) {
+            if (!isShowing || hostWindow == null) {
+                glassSyncRunning = false
+                return
+            }
+            syncGlassOrbUniforms()
+            if (SystemClock.uptimeMillis() < glassSyncUntilMs) {
+                Choreographer.getInstance().postFrameCallback(this)
+            } else {
+                glassSyncRunning = false
+            }
+        }
+    }
 
     private var glassRimView: LiquidGlassRimView? = null
 
@@ -166,6 +191,7 @@ class OverlayManager(private val context: Context) {
         fsFocusTarget = FullscreenFocusTarget.PIP_BTN
         isShowing = true
         isHiding = false
+        hasFirstFrame = false
 
         val pip = computePipTransform(cfg)
         val exp = computeExpandedTransform()
@@ -189,7 +215,7 @@ class OverlayManager(private val context: Context) {
         }
 
         val card = FrameLayout(context).apply {
-            setBackgroundColor(Color.parseColor("#FF10151E"))
+            setBackgroundColor(Color.parseColor("#FF0E131B"))
             alpha = 0f
             pivotX = 0f
             pivotY = 0f
@@ -218,6 +244,17 @@ class OverlayManager(private val context: Context) {
                 }
             }
         }
+
+        // Frosted Liquid Glass connecting backdrop showing the blurred last doorbell thumbnail
+        val backdrop = buildConnectingBackdrop()
+        connectingBackdrop = backdrop
+        card.addView(
+            backdrop,
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT,
+            )
+        )
 
         val videoView = TextureViewRenderer(context).apply {
             alpha = 0f
@@ -276,6 +313,7 @@ class OverlayManager(private val context: Context) {
         renderer = videoView
 
         host.requestFocus()
+        card.post { startGlassOrbSyncBurst(450L) }
 
         animateCardEntrance(card, pip, startFullscreen)
 
@@ -399,6 +437,25 @@ class OverlayManager(private val context: Context) {
         isAudioActive = active
         pipAudioOrb?.setActiveToggleState(active)
         fsAudioOrb?.setActiveToggleState(active)
+        startGlassOrbSyncBurst(220L)
+    }
+
+    /** Updates the frosted connecting preview if a fresh Ring activity thumbnail arrives before frame 1. */
+    fun updateFrostedPreview(frostedBitmap: Bitmap) {
+        mainHandler.post {
+            val img = connectingPreviewImage ?: return@post
+            if (!isShowing || isHiding || hasFirstFrame) return@post
+            img.setImageBitmap(frostedBitmap)
+            img.alpha = 0f
+            img.animate().alpha(1f).setDuration(220L).setInterpolator(enterEase).start()
+        }
+    }
+
+    /** Captures a clean 640x360 snapshot from the live video TextureView (only once video is visible). */
+    fun captureSnapshotBitmap(): Bitmap? {
+        val r = renderer ?: return null
+        if (!isShowing || !hasFirstFrame || !r.isAvailable) return null
+        return runCatching { r.getBitmap(640, 360) }.getOrNull()
     }
 
     private fun engageKeepAlive() {
@@ -501,6 +558,7 @@ class OverlayManager(private val context: Context) {
                     .setDuration(420L)
                     .setInterpolator(morphEase)
                     .start()
+                startGlassOrbSyncBurst(460L)
             } else {
                 fsTopRightRow?.apply {
                     animate().cancel()
@@ -529,6 +587,7 @@ class OverlayManager(private val context: Context) {
                     .setDuration(380L)
                     .setInterpolator(morphEase)
                     .start()
+                startGlassOrbSyncBurst(420L)
             }
         }
     }
@@ -605,6 +664,9 @@ class OverlayManager(private val context: Context) {
         dotAnimator = null
         connectingPulseAnimator?.cancel()
         connectingPulseAnimator = null
+        glassSyncRunning = false
+        glassSyncUntilMs = 0L
+        runCatching { Choreographer.getInstance().removeFrameCallback(glassSyncFrameCallback) }
         onDismissCallback = null
         onKeepAliveCallback = null
         onToggleAudioCallback = null
@@ -618,7 +680,10 @@ class OverlayManager(private val context: Context) {
         cardView = null
         rootParams = null
         currentCfg = null
+        connectingBackdrop = null
+        connectingPreviewImage = null
         connectingContainer = null
+        hasFirstFrame = false
         glassRimView = null
         pipTopRightRow = null
         pipAudioOrb = null
@@ -700,17 +765,25 @@ class OverlayManager(private val context: Context) {
 
     private fun revealVideoOnFirstFrame(videoView: TextureViewRenderer) {
         val cfg = currentCfg ?: return
+        hasFirstFrame = true
+        syncGlassOrbUniforms()
         connectingPulseAnimator?.cancel()
         connectingContainer?.animate()
             ?.alpha(0f)
-            ?.setDuration(150L)
+            ?.scaleX(0.94f)
+            ?.scaleY(0.94f)
+            ?.setDuration(220L)
+            ?.setInterpolator(exitEase)
             ?.withEndAction { connectingContainer?.visibility = View.GONE }
             ?.start()
 
         videoView.animate()
             .alpha(1f)
-            .setDuration(180L)
+            .setDuration(260L)
             .setInterpolator(enterEase)
+            .withEndAction {
+                connectingBackdrop?.visibility = View.GONE
+            }
             .start()
 
         if (!isKeepAlive) {
@@ -718,19 +791,71 @@ class OverlayManager(private val context: Context) {
         }
     }
 
-    private fun buildConnectingIndicator(activeScale: Float): View {
-        val pillDrawable = GradientDrawable().apply {
-            shape = GradientDrawable.RECTANGLE
-            cornerRadius = expDp(999, activeScale).toFloat()
-            setColor(Color.parseColor("#88161E2B"))
-            setStroke(expDp(1, activeScale), Color.parseColor("#44FFFFFF"))
+    private fun buildConnectingBackdrop(): FrameLayout {
+        val container = FrameLayout(context).apply {
+            background = GradientDrawable(
+                GradientDrawable.Orientation.TL_BR,
+                intArrayOf(
+                    Color.parseColor("#FF19202B"),
+                    Color.parseColor("#FF11161F"),
+                    Color.parseColor("#FF161D28"),
+                ),
+            )
         }
+
+        val frostedBitmap = SnapshotStore.loadFrostedPreview(context)
+        val img = ImageView(context).apply {
+            scaleType = ImageView.ScaleType.CENTER_CROP
+            if (frostedBitmap != null) {
+                setImageBitmap(frostedBitmap)
+            }
+            layoutParams = FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT,
+            )
+        }
+        connectingPreviewImage = img
+        container.addView(img)
+
+        // Subtle Apple Liquid Glass frost veil (specular diagonal light + gentle glass sheen)
+        val veil = LiquidGlassFrostVeilView(context).apply {
+            layoutParams = FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT,
+            )
+        }
+        container.addView(veil)
+        return container
+    }
+
+    private fun buildConnectingIndicator(activeScale: Float): View {
+        // Translucent Apple Liquid Glass pill matching iOS 26 / visionOS style (clear glass + crisp white specular rim)
+        val pillHost = FrameLayout(context).apply {
+            clipChildren = false
+            clipToPadding = false
+            layoutParams = FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                Gravity.CENTER,
+            )
+        }
+
+        val glassBg = LiquidGlassPillBackgroundView(
+            context = context,
+            strokeWidthPx = expDp(1, activeScale).toFloat() * 1.45f,
+        ).apply {
+            layoutParams = FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT,
+            )
+        }
+        pillHost.addView(glassBg)
+
         val row = LinearLayout(context).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            background = pillDrawable
-            val padH = expDp(16, activeScale)
-            val padV = expDp(9, activeScale)
+            val padH = expDp(18, activeScale)
+            val padV = expDp(10, activeScale)
             setPadding(padH, padV, padH, padV)
             layoutParams = FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.WRAP_CONTENT,
@@ -738,30 +863,40 @@ class OverlayManager(private val context: Context) {
                 Gravity.CENTER,
             )
         }
-        val dotSize = expDp(8, activeScale)
-        val dot = View(context).apply {
-            background = GradientDrawable().apply {
-                shape = GradientDrawable.OVAL
-                setColor(Color.parseColor("#FFFF453A"))
-            }
-            layoutParams = LinearLayout.LayoutParams(dotSize, dotSize).apply {
+
+        val spinnerSize = expDp(15, activeScale)
+        val spinner = AppleGlassSpinnerView(
+            context = context,
+            strokePx = expDp(2, activeScale).toFloat() * 0.9f,
+        ).apply {
+            layoutParams = LinearLayout.LayoutParams(spinnerSize, spinnerSize).apply {
                 rightMargin = expDp(10, activeScale)
             }
         }
-        connectingPulseAnimator = ObjectAnimator.ofFloat(dot, View.ALPHA, 1f, 0.25f, 1f).apply {
+        connectingPulseAnimator = ValueAnimator.ofFloat(0f, 360f).apply {
             duration = 950L
             repeatCount = ValueAnimator.INFINITE
+            interpolator = LinearInterpolator()
+            addUpdateListener { anim ->
+                spinner.sweepAngleDeg = anim.animatedValue as Float
+                spinner.invalidate()
+            }
             start()
         }
+
         val label = TextView(context).apply {
             text = "Connecting…"
-            setTextColor(Color.parseColor("#E6FFFFFF"))
-            setTextSize(TypedValue.COMPLEX_UNIT_PX, expDp(13, activeScale).toFloat())
+            setTextColor(Color.WHITE)
+            setTextSize(TypedValue.COMPLEX_UNIT_PX, expDp(14, activeScale).toFloat())
             typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+            letterSpacing = 0.02f
+            setShadowLayer(expDp(4, activeScale).toFloat(), 0f, expDp(1, activeScale).toFloat(), Color.parseColor("#66000000"))
         }
-        row.addView(dot)
+
+        row.addView(spinner)
         row.addView(label)
-        return row
+        pillHost.addView(row)
+        return pillHost
     }
 
     private fun buildLiquidGlassHud(
@@ -993,6 +1128,7 @@ class OverlayManager(private val context: Context) {
                 pipRow.scaleX = 0.7f
                 pipRow.scaleY = 0.7f
             }
+            startGlassOrbSyncBurst(220L)
             return
         }
 
@@ -1032,10 +1168,11 @@ class OverlayManager(private val context: Context) {
             .setInterpolator(popSpring)
             .start()
 
-        val audioScale = if (onAudio) 1.16f else 0.98f
-        val closeScale = if (onDismiss) 1.16f else 0.98f
+        val audioScale = if (onAudio) 1.15f else 0.98f
+        val closeScale = if (onDismiss) 1.15f else 0.98f
         audioOrb.animate().scaleX(audioScale).scaleY(audioScale).setDuration(170L).setInterpolator(popSpring).start()
         closeOrb.animate().scaleX(closeScale).scaleY(closeScale).setDuration(170L).setInterpolator(popSpring).start()
+        startGlassOrbSyncBurst(300L)
     }
 
     private fun updateFullscreenHudStyles(animated: Boolean) {
@@ -1051,14 +1188,15 @@ class OverlayManager(private val context: Context) {
         pipOrb.setFocusedState(onPip)
         closeOrb.setFocusedState(onClose)
 
-        val audioScale = if (onAudio) 1.15f else 0.96f
-        val pipScale = if (onPip) 1.15f else 0.96f
-        val closeScale = if (onClose) 1.15f else 0.96f
+        val audioScale = if (onAudio) 1.14f else 0.97f
+        val pipScale = if (onPip) 1.14f else 0.97f
+        val closeScale = if (onClose) 1.14f else 0.97f
 
         if (animated) {
             audioOrb.animate().scaleX(audioScale).scaleY(audioScale).setDuration(180L).setInterpolator(popSpring).start()
             pipOrb.animate().scaleX(pipScale).scaleY(pipScale).setDuration(180L).setInterpolator(popSpring).start()
             closeOrb.animate().scaleX(closeScale).scaleY(closeScale).setDuration(180L).setInterpolator(popSpring).start()
+            startGlassOrbSyncBurst(260L)
         } else {
             audioOrb.scaleX = audioScale
             audioOrb.scaleY = audioScale
@@ -1066,7 +1204,74 @@ class OverlayManager(private val context: Context) {
             pipOrb.scaleY = pipScale
             closeOrb.scaleX = closeScale
             closeOrb.scaleY = closeScale
+            syncGlassOrbUniforms()
         }
+    }
+
+    private fun startGlassOrbSyncBurst(durationMs: Long) {
+        syncGlassOrbUniforms()
+        glassSyncUntilMs = maxOf(glassSyncUntilMs, SystemClock.uptimeMillis() + durationMs)
+        if (!glassSyncRunning) {
+            glassSyncRunning = true
+            Choreographer.getInstance().postFrameCallback(glassSyncFrameCallback)
+        }
+    }
+
+    private fun syncGlassOrbUniforms() {
+        val rend = renderer ?: return
+        val card = cardView ?: return
+        val cw = card.width.toFloat()
+        val ch = card.height.toFloat()
+        if (cw <= 1f || ch <= 1f) return
+
+        val row: LinearLayout?
+        val o0: LiquidGlassOrbButton?
+        val o1: LiquidGlassOrbButton?
+        val o2: LiquidGlassOrbButton?
+
+        if (isFullscreen) {
+            row = fsTopRightRow
+            o0 = fsAudioOrb
+            o1 = fsPipOrb
+            o2 = fsCloseOrb
+        } else {
+            row = pipTopRightRow
+            o0 = pipAudioOrb
+            o1 = pipCloseOrb
+            o2 = null
+        }
+
+        if (row == null || row.visibility != View.VISIBLE || row.alpha <= 0.01f) {
+            rend.glassOrbState.clearOrbs()
+            return
+        }
+
+        fun mapOrb(orb: LiquidGlassOrbButton?): FloatArray {
+            if (orb == null || orb.width <= 0 || orb.height <= 0) {
+                return floatArrayOf(0f, 0f, 0f, 0f, 0f, 0f)
+            }
+            val cxRow = orb.left + orb.width * 0.5f + orb.translationX
+            val cyRow = orb.top + orb.height * 0.5f + orb.translationY
+            val cxCard = row.left + row.pivotX + (cxRow - row.pivotX) * row.scaleX + row.translationX
+            val cyCard = row.top + row.pivotY + (cyRow - row.pivotY) * row.scaleY + row.translationY
+            val rCard = orb.visualRadiusPx() * orb.scaleX * row.scaleX
+            val vidCx = (cxCard / cw) * 1280f
+            val vidCy = (cyCard / ch) * 720f
+            val vidR = (rCard / cw) * 1280f
+            val alpha = (row.alpha * orb.alpha).coerceIn(0f, 1f)
+            val focused = if (orb.isFocusedState) 1f else 0f
+            val active = if (orb.isActiveToggleState) 1f else 0f
+            return floatArrayOf(vidCx, vidCy, vidR, alpha, focused, active)
+        }
+
+        val m0 = mapOrb(o0)
+        val m1 = mapOrb(o1)
+        val m2 = mapOrb(o2)
+        rend.glassOrbState.setOrbs(
+            m0[0], m0[1], m0[2], m0[3], m0[4], m0[5],
+            m1[0], m1[1], m1[2], m1[3], m1[4], m1[5],
+            m2[0], m2[1], m2[2], m2[3], m2[4], m2[5],
+        )
     }
 
     private inner class LiquidGlassRimView(context: Context) : View(context) {
@@ -1123,7 +1328,136 @@ class OverlayManager(private val context: Context) {
     }
 
     /**
-     * Custom-rendered Apple visionOS / iOS Liquid Glass circular orb button.
+     * Subtle Apple Liquid Glass frost veil over the blurred connecting thumbnail.
+     */
+    private inner class LiquidGlassFrostVeilView(context: Context) : View(context) {
+        private val sheenPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
+
+        override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
+            super.onSizeChanged(w, h, oldw, oldh)
+            if (w <= 0 || h <= 0) return
+            sheenPaint.shader = LinearGradient(
+                0f, 0f, w.toFloat(), h.toFloat(),
+                intArrayOf(
+                    Color.parseColor("#24FFFFFF"),
+                    Color.parseColor("#0D0F1824"),
+                    Color.parseColor("#180C121C"),
+                    Color.parseColor("#1EFFFFFF"),
+                ),
+                floatArrayOf(0f, 0.35f, 0.72f, 1f),
+                Shader.TileMode.CLAMP,
+            )
+        }
+
+        override fun onDraw(canvas: Canvas) {
+            canvas.drawRect(0f, 0f, width.toFloat(), height.toFloat(), sheenPaint)
+        }
+    }
+
+    /**
+     * Translucent Apple Liquid Glass pill background (matching iOS 26 / visionOS Button pill).
+     */
+    private inner class LiquidGlassPillBackgroundView(
+        context: Context,
+        private val strokeWidthPx: Float,
+    ) : View(context) {
+        private val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
+        private val causticPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
+        private val rimPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE
+            strokeWidth = strokeWidthPx
+        }
+        private val rect = RectF()
+
+        override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
+            super.onSizeChanged(w, h, oldw, oldh)
+            if (w <= 0 || h <= 0) return
+            val wf = w.toFloat()
+            val hf = h.toFloat()
+            // Crystal-clear translucent glass body (not opaque dark navy)
+            fillPaint.shader = LinearGradient(
+                0f, 0f, wf, hf,
+                intArrayOf(
+                    Color.parseColor("#38FFFFFF"),
+                    Color.parseColor("#1E101824"),
+                    Color.parseColor("#2CFFFFFF"),
+                ),
+                floatArrayOf(0f, 0.52f, 1f),
+                Shader.TileMode.CLAMP,
+            )
+            // Soft top specular caustic sheen
+            causticPaint.shader = LinearGradient(
+                0f, 0f, 0f, hf * 0.55f,
+                intArrayOf(Color.parseColor("#44FFFFFF"), Color.TRANSPARENT),
+                null,
+                Shader.TileMode.CLAMP,
+            )
+            // Apple double-catchlight diagonal pure-white specular rim
+            rimPaint.shader = LinearGradient(
+                0f, 0f, wf, hf,
+                intArrayOf(
+                    Color.parseColor("#F5FFFFFF"),
+                    Color.parseColor("#55D8EEFF"),
+                    Color.parseColor("#35FFFFFF"),
+                    Color.parseColor("#E0FFFFFF"),
+                ),
+                floatArrayOf(0f, 0.38f, 0.68f, 1f),
+                Shader.TileMode.CLAMP,
+            )
+        }
+
+        override fun onDraw(canvas: Canvas) {
+            val wf = width.toFloat()
+            val hf = height.toFloat()
+            if (wf <= 0f || hf <= 0f) return
+            val inset = strokeWidthPx * 0.6f
+            val r = hf * 0.5f
+            rect.set(inset, inset, wf - inset, hf - inset)
+            canvas.drawRoundRect(rect, r, r, fillPaint)
+            canvas.drawRoundRect(rect, r, r, causticPaint)
+            canvas.drawRoundRect(rect, r, r, rimPaint)
+        }
+    }
+
+    /**
+     * Smooth 60 fps thin rounded-cap Apple-style arc spinner for the Liquid Glass connecting pill.
+     */
+    private inner class AppleGlassSpinnerView(
+        context: Context,
+        private val strokePx: Float,
+    ) : View(context) {
+        var sweepAngleDeg: Float = 0f
+        private val trackPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE
+            strokeWidth = strokePx
+            color = Color.parseColor("#38FFFFFF")
+        }
+        private val arcPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE
+            strokeWidth = strokePx
+            strokeCap = Paint.Cap.ROUND
+            color = Color.WHITE
+        }
+        private val rect = RectF()
+
+        override fun onDraw(canvas: Canvas) {
+            val wf = width.toFloat()
+            val hf = height.toFloat()
+            if (wf <= 0f || hf <= 0f) return
+            val pad = strokePx * 0.7f
+            rect.set(pad, pad, wf - pad, hf - pad)
+            canvas.drawOval(rect, trackPaint)
+            canvas.drawArc(rect, sweepAngleDeg - 90f, 235f, false, arcPaint)
+        }
+    }
+
+    /**
+     * True Apple iOS 26 / visionOS see-through Liquid Glass circular orb button.
+     *
+     * The underlying live video is optically refracted + frosted directly in the OpenGL ES 2.0
+     * fragment shader (WatermarkInpaintDrawer.kt). This View renders only the razor-crisp
+     * specular glass rim, subtle meniscus highlight, and SF-Symbols-grade minimalist vector icon
+     * so you genuinely see the live refracted scene behind each button.
      */
     private inner class LiquidGlassOrbButton(
         context: Context,
@@ -1131,10 +1465,14 @@ class OverlayManager(private val context: Context) {
         private val strokeScalePx: Float,
     ) : View(context) {
 
-        private var isFocusedOrb = false
-        private var isActiveToggle = false
-        private val bodyPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
-        private val lensPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
+        var isFocusedState: Boolean = false
+            private set
+        var isActiveToggleState: Boolean = false
+            private set
+
+        private val glassTintPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
+        private val meniscusPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
+        private val innerRimPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE }
         private val rimPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE }
         private val iconPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             style = Paint.Style.STROKE
@@ -1148,17 +1486,29 @@ class OverlayManager(private val context: Context) {
         }
         private val rect = RectF()
         private val speakerPath = Path()
+        private val arrowPath = Path()
+
+        init {
+            // Software layer only for crisp icon/rim drop-shadow readability over blazing white daylight sky
+            setLayerType(LAYER_TYPE_SOFTWARE, null)
+        }
+
+        fun visualRadiusPx(): Float {
+            val wf = width.toFloat()
+            val hf = height.toFloat()
+            return (minOf(wf, hf) * 0.5f - rimPaint.strokeWidth * 0.7f).coerceAtLeast(1f)
+        }
 
         fun setFocusedState(focused: Boolean) {
-            if (isFocusedOrb == focused) return
-            isFocusedOrb = focused
+            if (isFocusedState == focused) return
+            isFocusedState = focused
             rebuildShaders(width, height)
             invalidate()
         }
 
         fun setActiveToggleState(active: Boolean) {
-            if (isActiveToggle == active) return
-            isActiveToggle = active
+            if (isActiveToggleState == active) return
+            isActiveToggleState = active
             rebuildShaders(width, height)
             invalidate()
         }
@@ -1173,78 +1523,100 @@ class OverlayManager(private val context: Context) {
             val wf = w.toFloat()
             val hf = h.toFloat()
 
-            // 1. Translucent Liquid Glass body fill (luminous cyan-glass tint when audio toggle is active)
-            val bodyColors = when {
-                isActiveToggle && isFocusedOrb -> intArrayOf(
-                    Color.parseColor("#B02D6A9F"),
-                    Color.parseColor("#961E4870"),
-                    Color.parseColor("#A6265C8C"),
+            // 1. Ultra-light crystal surface wash (completely see-through so GPU refracted video shines through!)
+            val tintColors = when {
+                isActiveToggleState && isFocusedState -> intArrayOf(
+                    Color.parseColor("#385AC8FA"),
+                    Color.parseColor("#1A0A84FF"),
+                    Color.parseColor("#2E64D2FF"),
                 )
-                isActiveToggle -> intArrayOf(
-                    Color.parseColor("#8C22537D"),
-                    Color.parseColor("#78163754"),
-                    Color.parseColor("#851D476B"),
+                isActiveToggleState -> intArrayOf(
+                    Color.parseColor("#2838A8FF"),
+                    Color.parseColor("#120A84FF"),
+                    Color.parseColor("#205AC8FA"),
                 )
-                isFocusedOrb -> intArrayOf(
-                    Color.parseColor("#9434465E"),
-                    Color.parseColor("#801C2636"),
-                    Color.parseColor("#8C2A384D"),
+                isFocusedState -> intArrayOf(
+                    Color.parseColor("#38FFFFFF"),
+                    Color.parseColor("#14FFFFFF"),
+                    Color.parseColor("#28FFFFFF"),
                 )
                 else -> intArrayOf(
-                    Color.parseColor("#6E161E2B"),
-                    Color.parseColor("#5C0D121A"),
-                    Color.parseColor("#66131A26"),
+                    Color.parseColor("#20FFFFFF"),
+                    Color.parseColor("#0A0D141F"),
+                    Color.parseColor("#18FFFFFF"),
                 )
             }
-            bodyPaint.shader = LinearGradient(
+            glassTintPaint.shader = LinearGradient(
                 0f, 0f, wf, hf,
-                bodyColors,
-                floatArrayOf(0f, 0.55f, 1f),
-                Shader.TileMode.CLAMP,
-            )
-
-            // 2. Top-left internal specular lens caustic refraction
-            val causticTopAlpha = if (isFocusedOrb || isActiveToggle) "#66FFFFFF" else "#2EFFFFFF"
-            val causticMidAlpha = if (isFocusedOrb || isActiveToggle) "#22D4F0FF" else "#0CFFFFFF"
-            lensPaint.shader = RadialGradient(
-                wf * 0.30f,
-                hf * 0.24f,
-                wf * 0.68f,
-                intArrayOf(
-                    Color.parseColor(causticTopAlpha),
-                    Color.parseColor(causticMidAlpha),
-                    Color.TRANSPARENT,
-                ),
+                tintColors,
                 floatArrayOf(0f, 0.52f, 1f),
                 Shader.TileMode.CLAMP,
             )
 
-            // 3. Directional specular glass rim
-            rimPaint.strokeWidth = strokeScalePx * (if (isFocusedOrb) 1.85f else 1.25f)
-            val rimColors = if (isFocusedOrb || isActiveToggle) {
+            // 2. Curved top-left glass meniscus sheen (authentic Apple Liquid Glass dome light)
+            val topAlpha = if (isFocusedState || isActiveToggleState) "#58FFFFFF" else "#38FFFFFF"
+            val midAlpha = if (isFocusedState || isActiveToggleState) "#18E6F7FF" else "#0CFFFFFF"
+            meniscusPaint.shader = RadialGradient(
+                wf * 0.30f,
+                hf * 0.22f,
+                wf * 0.62f,
+                intArrayOf(
+                    Color.parseColor(topAlpha),
+                    Color.parseColor(midAlpha),
+                    Color.TRANSPARENT,
+                ),
+                floatArrayOf(0f, 0.50f, 1f),
+                Shader.TileMode.CLAMP,
+            )
+
+            // 3. Soft inner luminous Fresnel ring just inside the crisp outer rim
+            innerRimPaint.strokeWidth = strokeScalePx * (if (isFocusedState) 2.6f else 1.8f)
+            innerRimPaint.shader = LinearGradient(
+                0f, 0f, wf, hf,
+                intArrayOf(
+                    Color.parseColor(if (isFocusedState) "#66FFFFFF" else "#38FFFFFF"),
+                    Color.parseColor("#10FFFFFF"),
+                    Color.parseColor("#0CFFFFFF"),
+                    Color.parseColor(if (isFocusedState) "#55FFFFFF" else "#2EFFFFFF"),
+                ),
+                floatArrayOf(0f, 0.38f, 0.68f, 1f),
+                Shader.TileMode.CLAMP,
+            )
+
+            // 4. Razor-crisp Apple double-catchlight diagonal specular rim (bright top-left & bottom-right)
+            rimPaint.strokeWidth = strokeScalePx * (if (isFocusedState) 2.15f else 1.45f)
+            val rimColors = if (isFocusedState || isActiveToggleState) {
                 intArrayOf(
                     Color.parseColor("#FFFFFFFF"),
-                    Color.parseColor("#80B8E8FF"),
-                    Color.parseColor("#40FFFFFF"),
-                    Color.parseColor("#D9FFFFFF"),
+                    Color.parseColor("#78D8F0FF"),
+                    Color.parseColor("#48FFFFFF"),
+                    Color.parseColor("#F0FFFFFF"),
                 )
             } else {
                 intArrayOf(
-                    Color.parseColor("#99FFFFFF"),
-                    Color.parseColor("#33FFFFFF"),
-                    Color.parseColor("#1EFFFFFF"),
-                    Color.parseColor("#66FFFFFF"),
+                    Color.parseColor("#E6FFFFFF"),
+                    Color.parseColor("#48FFFFFF"),
+                    Color.parseColor("#32FFFFFF"),
+                    Color.parseColor("#C2FFFFFF"),
                 )
             }
             rimPaint.shader = LinearGradient(
                 0f, 0f, wf, hf,
                 rimColors,
-                floatArrayOf(0f, 0.4f, 0.7f, 1f),
+                floatArrayOf(0f, 0.38f, 0.68f, 1f),
                 Shader.TileMode.CLAMP,
             )
 
-            iconPaint.color = if (isFocusedOrb || isActiveToggle) Color.WHITE else Color.parseColor("#D9FFFFFF")
-            iconFillPaint.color = iconPaint.color
+            val iconColor = if (isFocusedState || isActiveToggleState) Color.WHITE else Color.parseColor("#F2FFFFFF")
+            iconPaint.color = iconColor
+            iconFillPaint.color = iconColor
+            // Subtle crisp drop-shadow keeps icons razor-sharp over both daylight sky and night shadows
+            val shadowRadius = strokeScalePx * 3.2f
+            val shadowDy = strokeScalePx * 0.9f
+            val shadowColor = Color.parseColor("#88000000")
+            iconPaint.setShadowLayer(shadowRadius, 0f, shadowDy, shadowColor)
+            iconFillPaint.setShadowLayer(shadowRadius, 0f, shadowDy, shadowColor)
+            rimPaint.setShadowLayer(strokeScalePx * 2.2f, 0f, strokeScalePx * 0.6f, Color.parseColor("#40000000"))
         }
 
         override fun onDraw(canvas: Canvas) {
@@ -1254,73 +1626,94 @@ class OverlayManager(private val context: Context) {
 
             val cx = wf * 0.5f
             val cy = hf * 0.5f
-            val radius = minOf(wf, hf) * 0.5f - rimPaint.strokeWidth * 0.6f
+            val radius = visualRadiusPx()
 
-            canvas.drawCircle(cx, cy, radius, bodyPaint)
-            canvas.drawCircle(cx, cy, radius, lensPaint)
+            canvas.drawCircle(cx, cy, radius, glassTintPaint)
+            canvas.drawCircle(cx, cy, radius, meniscusPaint)
+            canvas.drawCircle(cx, cy, (radius - innerRimPaint.strokeWidth * 0.55f).coerceAtLeast(1f), innerRimPaint)
             canvas.drawCircle(cx, cy, radius, rimPaint)
 
             when (iconType) {
                 GlassIconType.CLOSE_X -> {
-                    iconPaint.strokeWidth = strokeScalePx * 1.95f
-                    val d = radius * 0.34f
+                    // Refined slender SF-Symbol `xmark`
+                    iconPaint.strokeWidth = strokeScalePx * 1.85f
+                    val d = radius * 0.30f
                     canvas.drawLine(cx - d, cy - d, cx + d, cy + d, iconPaint)
                     canvas.drawLine(cx + d, cy - d, cx - d, cy + d, iconPaint)
                 }
                 GlassIconType.PIP_MINIMIZE -> {
-                    iconPaint.strokeWidth = strokeScalePx * 1.65f
-                    val ow = radius * 0.88f
-                    val oh = radius * 0.66f
-                    val cr = strokeScalePx * 2.2f
-                    rect.set(cx - ow * 0.5f, cy - oh * 0.5f, cx + ow * 0.5f, cy + oh * 0.5f)
+                    // Refined SF-Symbol `pip.enter`: outer screen + sleek corner PiP + subtle inward arrow
+                    iconPaint.strokeWidth = strokeScalePx * 1.55f
+                    val ow = radius * 0.92f
+                    val oh = radius * 0.68f
+                    val cr = strokeScalePx * 2.6f
+                    val left = cx - ow * 0.5f
+                    val top = cy - oh * 0.5f
+                    val right = cx + ow * 0.5f
+                    val bottom = cy + oh * 0.5f
+                    rect.set(left, top, right, bottom)
                     canvas.drawRoundRect(rect, cr, cr, iconPaint)
 
+                    // Solid rounded PiP inset in top-right corner (matching user's TOP_RIGHT PiP position!)
                     val pw = ow * 0.42f
                     val ph = oh * 0.42f
                     val inset = strokeScalePx * 2.1f
-                    rect.set(
-                        cx + ow * 0.5f - inset - pw,
-                        cy - oh * 0.5f + inset,
-                        cx + ow * 0.5f - inset,
-                        cy - oh * 0.5f + inset + ph,
-                    )
-                    val pcr = strokeScalePx * 1.2f
-                    canvas.drawRoundRect(rect, pcr, pcr, iconFillPaint)
+                    val pLeft = right - inset - pw
+                    val pTop = top + inset
+                    rect.set(pLeft, pTop, right - inset, pTop + ph)
+                    canvas.drawRoundRect(rect, strokeScalePx * 1.4f, strokeScalePx * 1.4f, iconFillPaint)
+
+                    // Crisp delicate diagonal arrow from bottom-left pointing toward the PiP corner
+                    val ax0 = left + ow * 0.22f
+                    val ay0 = bottom - oh * 0.24f
+                    val ax1 = pLeft - strokeScalePx * 1.6f
+                    val ay1 = pTop + ph + strokeScalePx * 1.2f
+                    iconPaint.strokeWidth = strokeScalePx * 1.35f
+                    canvas.drawLine(ax0, ay0, ax1, ay1, iconPaint)
+                    val head = strokeScalePx * 2.8f
+                    arrowPath.reset()
+                    arrowPath.moveTo(ax1 - head, ay1)
+                    arrowPath.lineTo(ax1, ay1)
+                    arrowPath.lineTo(ax1, ay1 + head)
+                    canvas.drawPath(arrowPath, iconPaint)
                 }
                 GlassIconType.AUDIO_TOGGLE -> {
-                    // Geometric SF-Symbol style Speaker Cone + Sound Waves (+ Mute Slash when muted)
-                    val spkLeft = cx - radius * 0.42f
-                    val spkMid = cx - radius * 0.24f
-                    val spkRight = cx - radius * 0.02f
-                    val boxHalfH = radius * 0.16f
-                    val coneHalfH = radius * 0.36f
+                    // Refined SF-Symbol `speaker.wave.2.fill` / `speaker.slash.fill`
+                    val shiftX = if (isActiveToggleState) -radius * 0.08f else 0f
+                    val spkLeft = cx + shiftX - radius * 0.36f
+                    val spkMid = cx + shiftX - radius * 0.18f
+                    val spkRight = cx + shiftX + radius * 0.05f
+                    val boxHalfH = radius * 0.15f
+                    val coneHalfH = radius * 0.34f
 
+                    // Rounded speaker silhouette
                     speakerPath.reset()
-                    speakerPath.moveTo(spkLeft, cy - boxHalfH)
+                    speakerPath.moveTo(spkLeft + strokeScalePx, cy - boxHalfH)
                     speakerPath.lineTo(spkMid, cy - boxHalfH)
                     speakerPath.lineTo(spkRight, cy - coneHalfH)
                     speakerPath.lineTo(spkRight, cy + coneHalfH)
                     speakerPath.lineTo(spkMid, cy + boxHalfH)
-                    speakerPath.lineTo(spkLeft, cy + boxHalfH)
+                    speakerPath.lineTo(spkLeft + strokeScalePx, cy + boxHalfH)
+                    speakerPath.quadTo(spkLeft, cy + boxHalfH, spkLeft, cy + boxHalfH - strokeScalePx)
+                    speakerPath.lineTo(spkLeft, cy - boxHalfH + strokeScalePx)
+                    speakerPath.quadTo(spkLeft, cy - boxHalfH, spkLeft + strokeScalePx, cy - boxHalfH)
                     speakerPath.close()
                     canvas.drawPath(speakerPath, iconFillPaint)
 
                     iconPaint.strokeWidth = strokeScalePx * 1.65f
-                    if (isActiveToggle) {
-                        // Active audio waves: two crisp arcs radiating right
-                        val r1 = radius * 0.24f
-                        rect.set(spkRight - r1 * 0.3f, cy - r1, spkRight + r1 * 1.3f, cy + r1)
-                        canvas.drawArc(rect, -42f, 84f, false, iconPaint)
+                    if (isActiveToggleState) {
+                        // Two graceful concentric Apple soundwave arcs
+                        val r1 = radius * 0.23f
+                        rect.set(spkRight - r1 * 0.25f, cy - r1, spkRight + r1 * 1.35f, cy + r1)
+                        canvas.drawArc(rect, -40f, 80f, false, iconPaint)
 
-                        val r2 = radius * 0.42f
-                        rect.set(spkRight - r2 * 0.3f, cy - r2, spkRight + r2 * 1.3f, cy + r2)
-                        canvas.drawArc(rect, -45f, 90f, false, iconPaint)
+                        val r2 = radius * 0.41f
+                        rect.set(spkRight - r2 * 0.25f, cy - r2, spkRight + r2 * 1.35f, cy + r2)
+                        canvas.drawArc(rect, -44f, 88f, false, iconPaint)
                     } else {
-                        // Muted speaker: small x mark to the right of the speaker cone
-                        val mx = cx + radius * 0.23f
-                        val md = radius * 0.16f
-                        canvas.drawLine(mx - md, cy - md, mx + md, cy + md, iconPaint)
-                        canvas.drawLine(mx + md, cy - md, mx - md, cy + md, iconPaint)
+                        // Iconic clean SF-Symbol diagonal mute slash across speaker
+                        val sd = radius * 0.35f
+                        canvas.drawLine(cx - sd, cy - sd, cx + sd, cy + sd, iconPaint)
                     }
                 }
             }

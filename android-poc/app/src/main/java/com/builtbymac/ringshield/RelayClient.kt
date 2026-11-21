@@ -20,6 +20,7 @@ data class RelayRingEvent(
     val ringEventTsMs: Long?,
     val relayRxTsMs: Long?,
     val synthetic: Boolean,
+    val thumbnailUrl: String? = null,
 )
 
 data class WhepResponse(
@@ -85,6 +86,7 @@ class RelayClient(
                                     ringEventTsMs = if (ev.isNull("ring_event_ts_ms")) null else ev.optLong("ring_event_ts_ms"),
                                     relayRxTsMs = if (ev.isNull("relay_rx_ts_ms")) null else ev.optLong("relay_rx_ts_ms"),
                                     synthetic = ev.optBoolean("synthetic", false),
+                                    thumbnailUrl = if (ev.isNull("thumbnail_url")) null else ev.optString("thumbnail_url", "").takeIf { it.isNotBlank() && it != "null" },
                                 )
                             )
                         }
@@ -156,6 +158,16 @@ class RelayClient(
         runCatching {
             http.newCall(reqBuilder.build()).execute().use { /* per-package PLAY_AUDIO mute */ }
         }.onFailure { Log.w(TAG, "setAppAudioMute failed: ${it.message}") }
+    }
+
+    suspend fun downloadThumbnailBytes(url: String): ByteArray? = withContext(Dispatchers.IO) {
+        runCatching {
+            val req = Request.Builder().url(url).get().build()
+            http.newCall(req).execute().use { res ->
+                if (!res.isSuccessful) return@withContext null
+                res.body?.bytes()
+            }
+        }.onFailure { Log.d(TAG, "Thumbnail fetch skipped: ${it.message}") }.getOrNull()
     }
 
     fun close() {

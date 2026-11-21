@@ -6,7 +6,7 @@ import android.util.Log
 import android.view.TextureView
 import org.webrtc.EglBase
 import org.webrtc.EglRenderer
-import org.webrtc.GlRectDrawer
+import org.webrtc.GlassOrbState
 import org.webrtc.RendererCommon
 import org.webrtc.VideoFrame
 import org.webrtc.VideoSink
@@ -14,16 +14,16 @@ import org.webrtc.VideoSink
 /**
  * Lightweight TextureView-backed WebRTC VideoSink using org.webrtc.EglRenderer directly.
  *
- * Why TextureView instead of SurfaceViewRenderer?
- * SurfaceView allocates a dedicated hardware video overlay plane that collides with
- * foreground streaming apps (Netflix, YouTube, Dolby Vision) on Android TV / Shield,
- * leaving a transparent hole. TextureView is GPU-composited into the overlay window
- * via OpenGL and renders reliably on top of active video playback.
+ * Uses WatermarkInpaintDrawerFactory to combine:
+ *  - Mask-guided 4-direction structure-preserving GPU watermark erasure (0% crop)
+ *  - Real-time 60 fps Apple Liquid Glass optical refraction + frosted backdrop blur behind HUD orbs
  */
 class TextureViewRenderer(context: Context) : TextureView(context),
     TextureView.SurfaceTextureListener, VideoSink {
 
     private val eglRenderer = EglRenderer("RingOverlayRenderer")
+    val glassOrbState = GlassOrbState()
+
     private var initialized = false
     @Volatile private var hasReceivedWebRtcFrame = false
     private var firstFrameNotified = false
@@ -49,12 +49,12 @@ class TextureViewRenderer(context: Context) : TextureView(context),
         this.onFirstFrame = onFirstFrame
         this.onResolutionChanged = onResolutionChanged
 
-        val drawer: RendererCommon.GlDrawer = if (inpaintWatermarks) {
-            Log.i(TAG, "Using WatermarkInpaintDrawer (GPU Coons-patch watermark eraser ON)")
-            org.webrtc.WatermarkInpaintDrawerFactory.create()
-        } else {
-            GlRectDrawer()
-        }
+        Log.i(TAG, "Initializing WatermarkGlassDrawer (mask-guided inpaint=$inpaintWatermarks + GPU Liquid Glass orbs)")
+        val drawer: RendererCommon.GlDrawer = org.webrtc.WatermarkInpaintDrawerFactory.create(
+            context = context,
+            glassState = glassOrbState,
+            inpaintWatermarks = inpaintWatermarks,
+        )
         eglRenderer.init(eglContext, EglBase.CONFIG_PLAIN, drawer)
         if (isAvailable && surfaceTexture != null) {
             eglRenderer.createEglSurface(surfaceTexture)
@@ -109,6 +109,7 @@ class TextureViewRenderer(context: Context) : TextureView(context),
         initialized = false
         onFirstFrame = null
         onResolutionChanged = null
+        glassOrbState.clearOrbs()
         eglRenderer.release()
     }
 

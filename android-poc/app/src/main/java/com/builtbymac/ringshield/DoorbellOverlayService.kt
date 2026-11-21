@@ -189,6 +189,13 @@ class DoorbellOverlayService : Service() {
 
         when {
             type.contains("motion") || type.contains("person") -> {
+                event.thumbnailUrl?.let { thumbUrl ->
+                    scope.launch {
+                        val bytes = relay.downloadThumbnailBytes(thumbUrl) ?: return@launch
+                        val frosted = SnapshotStore.saveBytes(applicationContext, bytes)
+                        frosted?.recycle()
+                    }
+                }
                 if (cfg.mode == TriggerMode.MOTION_PREWARM && activeOffer == null) {
                     prewarmPipeline()
                 }
@@ -281,6 +288,16 @@ class DoorbellOverlayService : Service() {
                             trial.success = true
                             latencyLogger.record(trial)
                         }
+                        // Capture a clean exposed live frame at t=2.2s for the next frosted Liquid Glass connecting screen
+                        scope.launch {
+                            delay(2_200L)
+                            val bmp = overlayManager.captureSnapshotBitmap() ?: return@launch
+                            try {
+                                SnapshotStore.saveBitmap(applicationContext, bmp)
+                            } finally {
+                                bmp.recycle()
+                            }
+                        }
                     },
                     onKeepAliveActivated = {
                         armSeamlessRollover(deviceId)
@@ -296,6 +313,15 @@ class DoorbellOverlayService : Service() {
                         stopActiveStream()
                     }
                 ) ?: error("Overlay permission missing (grant SYSTEM_ALERT_WINDOW)")
+
+                // If Ring webhook carried a fresh activity thumbnail URL, upgrade the frosted preview while connecting
+                event.thumbnailUrl?.let { thumbUrl ->
+                    scope.launch {
+                        val bytes = relay.downloadThumbnailBytes(thumbUrl) ?: return@launch
+                        val frosted = SnapshotStore.saveBytes(applicationContext, bytes) ?: return@launch
+                        overlayManager.updateFrostedPreview(frosted)
+                    }
+                }
 
                 val offer = freshPrewarm ?: webrtc.prepareOffer(cfg)
                 activeOffer = offer
@@ -493,6 +519,16 @@ class DoorbellOverlayService : Service() {
         val rend = activeRenderer
         activeVideoTrack = null
         activeRenderer = null
+        // Grab one final live snapshot right before closing so the next connecting preview is maximally fresh
+        overlayManager.captureSnapshotBitmap()?.let { finalBmp ->
+            scope.launch {
+                try {
+                    SnapshotStore.saveBitmap(applicationContext, finalBmp)
+                } finally {
+                    finalBmp.recycle()
+                }
+            }
+        }
         if (track != null && rend != null) {
             runCatching { track.removeSink(rend) }
         }
