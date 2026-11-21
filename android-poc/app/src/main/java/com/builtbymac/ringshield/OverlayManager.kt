@@ -829,32 +829,14 @@ class OverlayManager(private val context: Context) {
     }
 
     private fun buildConnectingIndicator(activeScale: Float): View {
-        // Translucent Apple Liquid Glass pill matching iOS 26 / visionOS style (clear glass + crisp white specular rim)
-        val pillHost = FrameLayout(context).apply {
-            clipChildren = false
-            clipToPadding = false
-            layoutParams = FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.WRAP_CONTENT,
-                FrameLayout.LayoutParams.WRAP_CONTENT,
-                Gravity.CENTER,
-            )
-        }
-
-        val glassBg = LiquidGlassPillBackgroundView(
+        // Sleek compact translucent Apple Liquid Glass pill tightly wrapping the spinner + label
+        val row = LiquidGlassPillLayout(
             context = context,
             strokeWidthPx = expDp(1, activeScale).toFloat() * 1.45f,
         ).apply {
-            layoutParams = FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.MATCH_PARENT,
-                FrameLayout.LayoutParams.MATCH_PARENT,
-            )
-        }
-        pillHost.addView(glassBg)
-
-        val row = LinearLayout(context).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            val padH = expDp(18, activeScale)
+            val padH = expDp(20, activeScale)
             val padV = expDp(10, activeScale)
             setPadding(padH, padV, padH, padV)
             layoutParams = FrameLayout.LayoutParams(
@@ -890,13 +872,12 @@ class OverlayManager(private val context: Context) {
             setTextSize(TypedValue.COMPLEX_UNIT_PX, expDp(14, activeScale).toFloat())
             typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
             letterSpacing = 0.02f
-            setShadowLayer(expDp(4, activeScale).toFloat(), 0f, expDp(1, activeScale).toFloat(), Color.parseColor("#66000000"))
+            setShadowLayer(expDp(4, activeScale).toFloat(), 0f, expDp(1, activeScale).toFloat(), Color.parseColor("#78000000"))
         }
 
         row.addView(spinner)
         row.addView(label)
-        pillHost.addView(row)
-        return pillHost
+        return row
     }
 
     private fun buildLiquidGlassHud(
@@ -1355,12 +1336,12 @@ class OverlayManager(private val context: Context) {
     }
 
     /**
-     * Translucent Apple Liquid Glass pill background (matching iOS 26 / visionOS Button pill).
+     * Translucent Apple Liquid Glass pill LinearLayout (tightly wraps content, matching iOS 26 Button pill).
      */
-    private inner class LiquidGlassPillBackgroundView(
+    private inner class LiquidGlassPillLayout(
         context: Context,
         private val strokeWidthPx: Float,
-    ) : View(context) {
+    ) : LinearLayout(context) {
         private val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
         private val causticPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
         private val rimPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -1369,37 +1350,38 @@ class OverlayManager(private val context: Context) {
         }
         private val rect = RectF()
 
+        init {
+            setWillNotDraw(false)
+        }
+
         override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
             super.onSizeChanged(w, h, oldw, oldh)
             if (w <= 0 || h <= 0) return
             val wf = w.toFloat()
             val hf = h.toFloat()
-            // Crystal-clear translucent glass body (not opaque dark navy)
             fillPaint.shader = LinearGradient(
                 0f, 0f, wf, hf,
                 intArrayOf(
-                    Color.parseColor("#38FFFFFF"),
-                    Color.parseColor("#1E101824"),
-                    Color.parseColor("#2CFFFFFF"),
+                    Color.parseColor("#42FFFFFF"),
+                    Color.parseColor("#2A101824"),
+                    Color.parseColor("#34FFFFFF"),
                 ),
                 floatArrayOf(0f, 0.52f, 1f),
                 Shader.TileMode.CLAMP,
             )
-            // Soft top specular caustic sheen
             causticPaint.shader = LinearGradient(
-                0f, 0f, 0f, hf * 0.55f,
-                intArrayOf(Color.parseColor("#44FFFFFF"), Color.TRANSPARENT),
+                0f, 0f, 0f, hf * 0.52f,
+                intArrayOf(Color.parseColor("#4CFFFFFF"), Color.TRANSPARENT),
                 null,
                 Shader.TileMode.CLAMP,
             )
-            // Apple double-catchlight diagonal pure-white specular rim
             rimPaint.shader = LinearGradient(
                 0f, 0f, wf, hf,
                 intArrayOf(
-                    Color.parseColor("#F5FFFFFF"),
-                    Color.parseColor("#55D8EEFF"),
-                    Color.parseColor("#35FFFFFF"),
-                    Color.parseColor("#E0FFFFFF"),
+                    Color.parseColor("#FAFFFFFF"),
+                    Color.parseColor("#66D8EEFF"),
+                    Color.parseColor("#40FFFFFF"),
+                    Color.parseColor("#E6FFFFFF"),
                 ),
                 floatArrayOf(0f, 0.38f, 0.68f, 1f),
                 Shader.TileMode.CLAMP,
@@ -1409,13 +1391,15 @@ class OverlayManager(private val context: Context) {
         override fun onDraw(canvas: Canvas) {
             val wf = width.toFloat()
             val hf = height.toFloat()
-            if (wf <= 0f || hf <= 0f) return
-            val inset = strokeWidthPx * 0.6f
-            val r = hf * 0.5f
-            rect.set(inset, inset, wf - inset, hf - inset)
-            canvas.drawRoundRect(rect, r, r, fillPaint)
-            canvas.drawRoundRect(rect, r, r, causticPaint)
-            canvas.drawRoundRect(rect, r, r, rimPaint)
+            if (wf > 0f && hf > 0f) {
+                val inset = strokeWidthPx * 0.6f
+                val r = hf * 0.5f
+                rect.set(inset, inset, wf - inset, hf - inset)
+                canvas.drawRoundRect(rect, r, r, fillPaint)
+                canvas.drawRoundRect(rect, r, r, causticPaint)
+                canvas.drawRoundRect(rect, r, r, rimPaint)
+            }
+            super.onDraw(canvas)
         }
     }
 

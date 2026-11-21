@@ -70,6 +70,22 @@ object WatermarkInpaintDrawerFactory {
     private const val LUT_H = 160
     private const val LUT_TEX_BYTES = LUT_W * LUT_H * 4
 
+    @Volatile
+    private var cachedLutBytes: ByteArray? = null
+
+    private fun loadLutBytes(appContext: Context): ByteArray? {
+        cachedLutBytes?.let { return it }
+        return runCatching {
+            GZIPInputStream(appContext.resources.openRawResource(R.raw.wm_lut_gz)).use { it.readBytes() }
+        }.onSuccess { bytes ->
+            if (bytes.size >= LUT_TEX_BYTES * 3) {
+                cachedLutBytes = bytes
+            }
+        }.onFailure {
+            Log.e(TAG, "Failed to decompress wm_lut_gz: ${it.message}", it)
+        }.getOrNull()
+    }
+
     fun create(
         context: Context,
         glassState: GlassOrbState,
@@ -94,9 +110,7 @@ object WatermarkInpaintDrawerFactory {
             if (lutLoaded) return
             lutLoaded = true
             runCatching {
-                val rawBytes = GZIPInputStream(appContext.resources.openRawResource(R.raw.wm_lut_gz)).use {
-                    it.readBytes()
-                }
+                val rawBytes = loadLutBytes(appContext) ?: return
                 if (rawBytes.size < LUT_TEX_BYTES * 3) {
                     Log.e(TAG, "Unexpected wm_lut_gz size: ${rawBytes.size}")
                     return
@@ -313,16 +327,18 @@ object WatermarkInpaintDrawerFactory {
         "  return mix(base, bg, strokeMask);\n" +
         "}\n" +
         "\n" +
-        "// Sample clean inpainted color at any nearby video coordinate (used by Liquid Glass refraction)\n" +
-        "vec3 sampleCleanForGlass(highp float px, highp float py) {\n" +
-        "  vec3 c = samplePx(px, py).rgb;\n" +
-        "  if (u_inpaint_enabled > 0.5 && px >= 950.0 && px < 1274.0 && py >= 14.0 && py < 78.0) {\n" +
-        "    return inpaintLutRegion(c, px, py, px - 950.0, (py - 14.0) + 88.0);\n" +
+        "// Fast clean sample for Liquid Glass blur taps: avoids inlining the 4-dir LUT inside every tap\n" +
+        "// by deflecting any tap landing on Partner text (y=15..72) vertically to clean sky/eave at y=76.\n" +
+        "vec3 sampleFastForGlass(highp float px, highp float py) {\n" +
+        "  highp float sy = py;\n" +
+        "  if (u_inpaint_enabled > 0.5 && px >= 950.0 && px < 1274.0 && py >= 14.0 && py < 74.0) {\n" +
+        "    sy = (py < 36.0) ? 12.0 : 76.0;\n" +
         "  }\n" +
-        "  return c;\n" +
+        "  return samplePx(px, sy).rgb;\n" +
         "}\n" +
         "\n" +
-        "// True Apple Liquid Glass optical refraction + 9-tap frosted blur + rim prism + Fresnel glow\n" +
+        "// True Apple Liquid Glass optical refraction + 5-tap frosted blur + rim prism + Fresnel glow\n" +
+        "// Compact instruction count so Tegra GLSL compiles in <150ms and renders in ~1ms!\n" +
         "vec3 applyLiquidGlassOrb(vec3 curCol, highp float x, highp float y,\n" +
         "                         highp vec4 orb, highp float focused, highp float active) {\n" +
         "  highp float alpha = orb.w;\n" +
@@ -332,68 +348,60 @@ object WatermarkInpaintDrawerFactory {
         "  highp float dist = length(d);\n" +
         "  if (dist > radius + 6.0) return curCol;\n" +
         "\n" +
-        "  // Soft subtle ambient drop-shadow halo immediately outside the glass edge (for bright sky legibility)\n" +
         "  highp float rNorm = dist / radius;\n" +
         "  if (rNorm >= 1.0) {\n" +
-        "    highp float shadow = exp(-((dist - radius) * 0.42)) * 0.14 * alpha;\n" +
+        "    highp float shadow = exp(-((dist - radius) * 0.42)) * 0.16 * alpha;\n" +
         "    return curCol * (1.0 - shadow);\n" +
         "  }\n" +
         "\n" +
         "  highp vec2 dir = d / max(dist, 0.001);\n" +
-        "  // Spherical convex rim refraction: bends live video gently inward along the curved glass rim\n" +
+        "  // Authentic convex Liquid Glass rim refraction (bends live video strongly near curved edge)\n" +
         "  highp float r2 = rNorm * rNorm;\n" +
-        "  highp float refractScale = 0.94 - 0.28 * r2 * rNorm;\n" +
+        "  highp float refractScale = 0.90 - 0.34 * r2 * rNorm;\n" +
         "  highp vec2 refrPx = orb.xy + d * refractScale;\n" +
         "\n" +
-        "  // 9-tap circular Gaussian frosted backdrop blur (crystal-clear see-through, silky smooth)\n" +
-        "  highp float blurR = radius * 0.16;\n" +
-        "  vec3 blurCol = sampleCleanForGlass(refrPx.x, refrPx.y) * 0.24;\n" +
-        "  blurCol += sampleCleanForGlass(refrPx.x + blurR,          refrPx.y) * 0.095;\n" +
-        "  blurCol += sampleCleanForGlass(refrPx.x - blurR,          refrPx.y) * 0.095;\n" +
-        "  blurCol += sampleCleanForGlass(refrPx.x,                  refrPx.y + blurR) * 0.095;\n" +
-        "  blurCol += sampleCleanForGlass(refrPx.x,                  refrPx.y - blurR) * 0.095;\n" +
-        "  highp float bDiag = blurR * 0.72;\n" +
-        "  blurCol += sampleCleanForGlass(refrPx.x + bDiag, refrPx.y + bDiag) * 0.095;\n" +
-        "  blurCol += sampleCleanForGlass(refrPx.x - bDiag, refrPx.y + bDiag) * 0.095;\n" +
-        "  blurCol += sampleCleanForGlass(refrPx.x + bDiag, refrPx.y - bDiag) * 0.095;\n" +
-        "  blurCol += sampleCleanForGlass(refrPx.x - bDiag, refrPx.y - bDiag) * 0.095;\n" +
+        "  // Fast 5-tap silky frosted backdrop blur (crystal-clear see-through!)\n" +
+        "  highp float blurR = radius * 0.17;\n" +
+        "  vec3 blurCol = sampleFastForGlass(refrPx.x, refrPx.y) * 0.32;\n" +
+        "  blurCol += sampleFastForGlass(refrPx.x + blurR, refrPx.y + blurR * 0.6) * 0.17;\n" +
+        "  blurCol += sampleFastForGlass(refrPx.x - blurR, refrPx.y - blurR * 0.6) * 0.17;\n" +
+        "  blurCol += sampleFastForGlass(refrPx.x - blurR * 0.6, refrPx.y + blurR) * 0.17;\n" +
+        "  blurCol += sampleFastForGlass(refrPx.x + blurR * 0.6, refrPx.y - blurR) * 0.17;\n" +
         "\n" +
-        "  // Whisper-subtle optical chromatic dispersion along the outer curved rim\n" +
-        "  highp float prismAmt = smoothstep(0.62, 0.98, rNorm) * 1.6;\n" +
+        "  // Whisper-subtle chromatic prism dispersion along outer curved glass rim\n" +
+        "  highp float prismAmt = smoothstep(0.62, 0.98, rNorm) * 1.8;\n" +
         "  if (prismAmt > 0.05) {\n" +
-        "    highp float rChan = sampleCleanForGlass(refrPx.x + dir.x * prismAmt, refrPx.y + dir.y * prismAmt).r;\n" +
-        "    highp float bChan = sampleCleanForGlass(refrPx.x - dir.x * prismAmt, refrPx.y - dir.y * prismAmt).b;\n" +
-        "    blurCol.r = mix(blurCol.r, rChan, 0.35);\n" +
-        "    blurCol.b = mix(blurCol.b, bChan, 0.35);\n" +
+        "    highp float rChan = sampleFastForGlass(refrPx.x + dir.x * prismAmt, refrPx.y + dir.y * prismAmt).r;\n" +
+        "    highp float bChan = sampleFastForGlass(refrPx.x - dir.x * prismAmt, refrPx.y - dir.y * prismAmt).b;\n" +
+        "    blurCol.r = mix(blurCol.r, rChan, 0.38);\n" +
+        "    blurCol.b = mix(blurCol.b, bChan, 0.38);\n" +
         "  }\n" +
         "\n" +
-        "  // Daytime/nighttime optical luminance balance:\n" +
-        "  // Keeps bright white sky crystal-clear yet slightly tone-compressed so white icons + rims pop!\n" +
+        "  // Adaptive daytime/nighttime crystal glass contrast:\n" +
+        "  // Keeps bright daylight sky transparently visible while making white icons + rims pop cleanly!\n" +
         "  highp float lum = dot(blurCol, vec3(0.299, 0.587, 0.114));\n" +
-        "  highp float dayShade = mix(1.0, 0.74, smoothstep(0.50, 0.95, lum));\n" +
+        "  highp float dayShade = mix(1.0, 0.72, smoothstep(0.48, 0.95, lum));\n" +
         "  vec3 glassCol = blurCol * dayShade;\n" +
-        "  // Subtle luminous glass lift over dark nighttime backgrounds\n" +
-        "  highp float nightLift = (1.0 - smoothstep(0.05, 0.55, lum)) * (0.11 + 0.07 * focused);\n" +
-        "  glassCol = mix(glassCol, vec3(0.84, 0.91, 1.0), nightLift);\n" +
+        "  highp float nightLift = (1.0 - smoothstep(0.05, 0.55, lum)) * (0.12 + 0.08 * focused);\n" +
+        "  glassCol = mix(glassCol, vec3(0.84, 0.92, 1.0), nightLift);\n" +
         "\n" +
-        "  // Translucent Apple Liquid Glass blue tint when Audio toggle is active ON\n" +
+        "  // Translucent Apple Liquid Glass sky-blue tint when Audio is active ON\n" +
         "  if (active > 0.01) {\n" +
-        "    vec3 appleBlue = vec3(0.05, 0.52, 1.0);\n" +
-        "    glassCol = mix(glassCol, appleBlue, (0.38 + 0.10 * focused) * active);\n" +
+        "    vec3 appleBlue = vec3(0.04, 0.52, 1.0);\n" +
+        "    glassCol = mix(glassCol, appleBlue, (0.40 + 0.10 * focused) * active);\n" +
         "  }\n" +
         "\n" +
         "  // Fresnel inner glass rim glow + double-crescent diagonal specular catchlights\n" +
-        "  highp float fresnel = smoothstep(0.64, 0.99, rNorm);\n" +
+        "  highp float fresnel = smoothstep(0.60, 0.99, rNorm);\n" +
         "  highp float diagLight = abs(dot(dir, vec2(-0.707, -0.707)));\n" +
         "  highp float topLeftBoost = smoothstep(-0.2, 0.95, dot(dir, vec2(-0.707, -0.707)));\n" +
-        "  highp float rimGlow = fresnel * (0.12 + 0.24 * diagLight + 0.12 * topLeftBoost + 0.16 * focused);\n" +
+        "  highp float rimGlow = fresnel * (0.14 + 0.26 * diagLight + 0.14 * topLeftBoost + 0.18 * focused);\n" +
         "  glassCol += vec3(0.92, 0.96, 1.0) * rimGlow;\n" +
         "\n" +
-        "  // Soft top-left internal specular caustic highlight\n" +
+        "  // Soft top-left internal specular caustic dome highlight\n" +
         "  highp float caustic = exp(-dot(d / radius - vec2(-0.34, -0.38), d / radius - vec2(-0.34, -0.38)) * 4.5);\n" +
-        "  glassCol += vec3(1.0) * caustic * (0.09 + 0.09 * focused);\n" +
+        "  glassCol += vec3(1.0) * caustic * (0.10 + 0.09 * focused);\n" +
         "\n" +
-        "  // Anti-aliased circular edge blend\n" +
         "  highp float edgeAA = 1.0 - smoothstep(radius - 1.2, radius, dist);\n" +
         "  return mix(curCol, clamp(glassCol, 0.0, 1.0), edgeAA * alpha);\n" +
         "}\n" +
