@@ -132,7 +132,7 @@ class OverlayManager(private val context: Context) {
 
     private var isPipHovered: Boolean = false
     private var pipFocusTarget: PipFocusTarget = PipFocusTarget.CARD
-    private var fsFocusTarget: FullscreenFocusTarget = FullscreenFocusTarget.PIP_BTN
+    private var fsFocusTarget: FullscreenFocusTarget = FullscreenFocusTarget.DISMISS_BTN
     private var isHiding: Boolean = false
 
     fun canDrawOverlays(): Boolean = runCatching { Settings.canDrawOverlays(context) }.getOrDefault(false)
@@ -168,7 +168,7 @@ class OverlayManager(private val context: Context) {
         isAudioActive = false
         isPipHovered = false
         pipFocusTarget = PipFocusTarget.CARD
-        fsFocusTarget = FullscreenFocusTarget.PIP_BTN
+        fsFocusTarget = FullscreenFocusTarget.DISMISS_BTN
         isShowing = true
         isHiding = false
         hasFirstFrame = false
@@ -199,7 +199,9 @@ class OverlayManager(private val context: Context) {
             alpha = 0f
             pivotX = 0f
             pivotY = 0f
-            elevation = if (startFullscreen) dp(28).toFloat() else dp(18).toFloat()
+            // Keep elevation at 0f to avoid Android 11 Tegra Skia's rectangular spot-shadow artifact
+            // underneath scaled rounded TYPE_APPLICATION_OVERLAY cards
+            elevation = 0f
             outlineProvider = object : ViewOutlineProvider() {
                 override fun getOutline(view: View, outline: Outline) {
                     outline.setRoundRect(0, 0, view.width, view.height, currentCornerRadiusPx)
@@ -528,12 +530,12 @@ class OverlayManager(private val context: Context) {
                     }
                 }
 
-                // 2. Stage Fullscreen dock to glide in gracefully once the card has opened up
-                fsFocusTarget = FullscreenFocusTarget.PIP_BTN
+                // 2. Stage Fullscreen dock to glide in gracefully with Close (`✕`, slot 2) focused by default
+                fsFocusTarget = FullscreenFocusTarget.DISMISS_BTN
                 fsDock?.let { dock ->
                     dock.animate().cancel()
                     dock.setAudioActive(isAudioActive)
-                    dock.setFocusedSlot(1, animated = false)
+                    dock.setFocusedSlot(2, animated = false)
                     dock.alpha = 0f
                     dock.translationY = -fsDockSlidePx
                     dock.visibility = View.VISIBLE
@@ -552,7 +554,7 @@ class OverlayManager(private val context: Context) {
                     animate().alpha(0.70f).setDuration(260L).start()
                 }
 
-                card.elevation = dp(28).toFloat()
+                card.elevation = 0f
                 animateCornerRadius(card, currentCornerRadiusPx, exp.unscaledCornerRadius, 400L)
 
                 card.animate()
@@ -598,7 +600,7 @@ class OverlayManager(private val context: Context) {
                     animate().alpha(0f).setDuration(160L).start()
                 }
 
-                card.elevation = dp(18).toFloat()
+                card.elevation = 0f
                 animateCornerRadius(card, currentCornerRadiusPx, pip.unscaledCornerRadius, 360L)
 
                 card.animate()
@@ -740,7 +742,7 @@ class OverlayManager(private val context: Context) {
             val startScale = exp.scaleX * 0.94f
             val startX = (screenW - screenW * startScale) / 2f
             val startY = (screenH - screenH * startScale) / 2f + dp(16)
-            card.elevation = dp(28).toFloat()
+            card.elevation = 0f
 
             card.pivotX = 0f
             card.pivotY = 0f
@@ -766,7 +768,7 @@ class OverlayManager(private val context: Context) {
         val startX = pip.x + edgeSlideDeltaPx(cfg)
         val startY = pip.y + (cfg.overlayHeightPx * 0.04f)
 
-        card.elevation = dp(18).toFloat()
+        card.elevation = 0f
         card.pivotX = 0f
         card.pivotY = 0f
         card.translationX = startX
@@ -996,7 +998,7 @@ class OverlayManager(private val context: Context) {
                 }
             },
         ).apply {
-            setFocusedSlot(1, animated = false)
+            setFocusedSlot(2, animated = false)
             alpha = if (startFullscreen) 1f else 0f
             translationY = if (startFullscreen) 0f else -fsDockSlidePx
             visibility = if (startFullscreen) View.VISIBLE else View.GONE
@@ -1041,7 +1043,7 @@ class OverlayManager(private val context: Context) {
                         .start()
                 }
                 if (!isFullscreen) {
-                    card.elevation = dp(18).toFloat()
+                    card.elevation = 0f
                     card.animate()
                         .scaleX(pip.scaleX)
                         .scaleY(pip.scaleY)
@@ -1078,8 +1080,7 @@ class OverlayManager(private val context: Context) {
         rim.animate().cancel()
         rim.animate().alpha(if (onCard) 1f else 0.50f).setDuration(170L).start()
 
-        // Physical Apple tvOS card elevation lift when focusing the PiP card
-        card.elevation = dp(if (onCard) 26 else 18).toFloat()
+        card.elevation = 0f
         card.animate().cancel()
         card.animate()
             .scaleX(targetScaleX)
