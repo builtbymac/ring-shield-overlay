@@ -90,7 +90,7 @@ object SnapshotStore {
         small.getPixels(pixels, 0, w, 0, 0, w, h)
         val scratch = IntArray(w * h)
 
-        val radius = 10
+        val radius = 7
         repeat(3) {
             boxBlurH(pixels, scratch, w, h, radius)
             boxBlurV(scratch, pixels, w, h, radius)
