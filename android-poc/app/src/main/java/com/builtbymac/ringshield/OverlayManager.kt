@@ -112,6 +112,7 @@ class OverlayManager(private val context: Context) {
     private var onDismissCallback: (() -> Unit)? = null
     private var onKeepAliveCallback: (() -> Unit)? = null
     private var onToggleAudioCallback: (() -> Boolean)? = null
+    private var onOverlayStateChangedCallback: ((Boolean, Boolean) -> Unit)? = null
 
     @Volatile
     var isShowing: Boolean = false
@@ -144,6 +145,7 @@ class OverlayManager(private val context: Context) {
         onFirstFrameVisible: () -> Unit,
         onKeepAliveActivated: () -> Unit = {},
         onToggleAudio: () -> Boolean = { false },
+        onOverlayStateChanged: (showing: Boolean, fullscreen: Boolean) -> Unit = { _, _ -> },
         onAutoDismiss: () -> Unit,
     ): TextureViewRenderer? {
         if (!canDrawOverlays()) {
@@ -160,6 +162,7 @@ class OverlayManager(private val context: Context) {
         onDismissCallback = onAutoDismiss
         onKeepAliveCallback = onKeepAliveActivated
         onToggleAudioCallback = onToggleAudio
+        onOverlayStateChangedCallback = onOverlayStateChanged
         isFullscreen = startFullscreen
         isKeepAlive = keepAliveUntilDismissed || startFullscreen
         isAudioActive = false
@@ -293,6 +296,7 @@ class OverlayManager(private val context: Context) {
 
         host.requestFocus()
         animateCardEntrance(card, pip, startFullscreen)
+        onOverlayStateChangedCallback?.invoke(true, startFullscreen)
 
         scheduleAutoDismiss(
             if (isKeepAlive) KEEP_ALIVE_SAFETY_CAP_MS
@@ -491,6 +495,7 @@ class OverlayManager(private val context: Context) {
 
             isFullscreen = expand
             engageKeepAlive()
+            onOverlayStateChangedCallback?.invoke(true, expand)
 
             card.animate().cancel()
             cornerAnimator?.cancel()
@@ -684,9 +689,12 @@ class OverlayManager(private val context: Context) {
         connectingPulseAnimator = null
         pipDock?.cancelAnimations()
         fsDock?.cancelAnimations()
+        val stateCb = onOverlayStateChangedCallback
+        val wasShowing = isShowing
         onDismissCallback = null
         onKeepAliveCallback = null
         onToggleAudioCallback = null
+        onOverlayStateChangedCallback = null
 
         val r = renderer
         renderer = null
@@ -715,6 +723,9 @@ class OverlayManager(private val context: Context) {
             runCatching { h.animate().cancel() }
             runCatching { h.removeAllViews() }
             runCatching { wm.removeViewImmediate(h) }
+        }
+        if (wasShowing) {
+            stateCb?.invoke(false, false)
         }
     }
 

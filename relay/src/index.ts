@@ -378,6 +378,12 @@ async function main(): Promise<void> {
       })
     : null
 
+  if (alexaHue) {
+    hub.onOverlayStateChange(({ showing, fullscreen }) => {
+      alexaHue.syncOverlayState(showing, fullscreen)
+    })
+  }
+
   await auth.warm()
 
   server.listen(cfg.port, cfg.host, () => {

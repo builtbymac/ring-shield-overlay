@@ -10,6 +10,11 @@ interface AliveSocket extends WebSocket {
   clientId?: string
 }
 
+export interface OverlayLiveState {
+  showing: boolean
+  fullscreen: boolean
+}
+
 /**
  * Ultra-low-latency LAN WebSocket broadcast hub for Shield Pro clients.
  * Keeps TCP sockets warm with 20 s WebSocket pings so notifications arrive in <1 ms.
@@ -17,6 +22,8 @@ interface AliveSocket extends WebSocket {
 export class ShieldWsHub {
   private readonly wss: WebSocketServer
   private readonly pingTimer: NodeJS.Timeout
+  private readonly stateListeners = new Set<(state: OverlayLiveState) => void>()
+  private currentOverlayState: OverlayLiveState = { showing: false, fullscreen: false }
 
   constructor(server: Server, lanToken?: string) {
     this.wss = new WebSocketServer({ noServer: true })
@@ -57,8 +64,29 @@ export class ShieldWsHub {
         ws.isAlive = true
       })
 
+      ws.on('message', (data) => {
+        try {
+          const msg = JSON.parse(data.toString('utf8')) as {
+            kind?: string
+            showing?: boolean
+            fullscreen?: boolean
+          }
+          if (msg.kind === 'overlay_state' && typeof msg.showing === 'boolean') {
+            this.updateOverlayState({
+              showing: msg.showing,
+              fullscreen: Boolean(msg.fullscreen),
+            })
+          }
+        } catch {
+          // Ignore malformed client frames
+        }
+      })
+
       ws.on('close', () => {
         console.log(`[ws] Shield disconnected (${ws.clientId}), total=${this.clientCount}`)
+        if (this.clientCount === 0) {
+          this.updateOverlayState({ showing: false, fullscreen: false })
+        }
       })
 
       ws.on('error', (err) => {
@@ -80,6 +108,31 @@ export class ShieldWsHub {
       }
     }, 20_000)
     this.pingTimer.unref()
+  }
+
+  get overlayState(): OverlayLiveState {
+    return this.currentOverlayState
+  }
+
+  onOverlayStateChange(listener: (state: OverlayLiveState) => void): void {
+    this.stateListeners.add(listener)
+    listener(this.currentOverlayState)
+  }
+
+  private updateOverlayState(next: OverlayLiveState): void {
+    if (
+      this.currentOverlayState.showing === next.showing &&
+      this.currentOverlayState.fullscreen === next.fullscreen
+    ) {
+      return
+    }
+    this.currentOverlayState = next
+    console.log(`[ws] Shield overlay state -> showing=${next.showing} fullscreen=${next.fullscreen}`)
+    for (const listener of this.stateListeners) {
+      try {
+        listener(next)
+      } catch {}
+    }
   }
 
   get clientCount(): number {

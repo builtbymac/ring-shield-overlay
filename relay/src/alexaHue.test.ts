@@ -74,6 +74,31 @@ test('AlexaHueBridge handles pairing, device discovery, and Shield command dispa
     })
     assert.equal(off1.status, 200)
     assert.deepEqual(dispatched, ['show', 'fullscreen', 'dismiss'])
+
+    // 7. Two-way sync from Shield Pro updates Hue lights accurately
+    bridge.syncOverlayState(true, true)
+    let stateCheck = (await (await fetch(`${base}/api/${user}/lights`)).json()) as Record<
+      string,
+      { state: { on: boolean } }
+    >
+    assert.equal(stateCheck['1'].state.on, true)
+    assert.equal(stateCheck['2'].state.on, true)
+
+    bridge.syncOverlayState(true, false)
+    stateCheck = (await (await fetch(`${base}/api/${user}/lights`)).json()) as Record<
+      string,
+      { state: { on: boolean } }
+    >
+    assert.equal(stateCheck['1'].state.on, true)
+    assert.equal(stateCheck['2'].state.on, false)
+
+    bridge.syncOverlayState(false, false)
+    stateCheck = (await (await fetch(`${base}/api/${user}/lights`)).json()) as Record<
+      string,
+      { state: { on: boolean } }
+    >
+    assert.equal(stateCheck['1'].state.on, false)
+    assert.equal(stateCheck['2'].state.on, false)
   } finally {
     bridge.stop()
     server.close()

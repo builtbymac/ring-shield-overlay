@@ -57,7 +57,6 @@ export class AlexaHueBridge {
   private readonly lights: Map<string, VirtualLight>
   private httpServer: http.Server | null = null
   private ssdpSocket: dgram.Socket | null = null
-  private readonly resetTimers = new Map<string, NodeJS.Timeout>()
 
   constructor(opts: AlexaHueOptions) {
     this.port = opts.port ?? 80
@@ -122,9 +121,21 @@ export class AlexaHueBridge {
     })
   }
 
+  /** Keeps virtual Hue light states synced 1:1 with the real overlay state on the Shield Pro. */
+  syncOverlayState(showing: boolean, fullscreen: boolean): void {
+    const viewLight = this.lights.get('1')
+    const fsLight = this.lights.get('2')
+    if (viewLight) {
+      // "Front Door View" is ON whenever any doorbell overlay (PiP or Fullscreen) is visible
+      viewLight.on = showing
+    }
+    if (fsLight) {
+      // "Front Door Fullscreen" is ON only when Theater Fullscreen is visible
+      fsLight.on = showing && fullscreen
+    }
+  }
+
   stop(): void {
-    for (const t of this.resetTimers.values()) clearTimeout(t)
-    this.resetTimers.clear()
     if (this.ssdpSocket) {
       try {
         this.ssdpSocket.close()
@@ -212,25 +223,20 @@ export class AlexaHueBridge {
       const results: Array<{ success: Record<string, unknown> }> = []
 
       if (typeof body.on === 'boolean') {
-        light.on = body.on
-        results.push({ success: { [`/lights/${light.id}/state/on`]: light.on } })
-        const action = light.on ? light.onAction : light.offAction
+        const desiredOn = body.on
+        const action = desiredOn ? light.onAction : light.offAction
+        if (!desiredOn) {
+          this.syncOverlayState(false, false)
+        } else if (light.id === '2') {
+          this.syncOverlayState(true, true)
+        } else {
+          this.syncOverlayState(true, false)
+        }
+        results.push({ success: { [`/lights/${light.id}/state/on`]: desiredOn } })
         const delivered = this.hub.broadcastCommand(action)
         console.log(
-          `[alexa-hue] "${light.name}" -> ${light.on ? 'ON' : 'OFF'} => Shield action=${action} (delivered=${delivered})`,
+          `[alexa-hue] "${light.name}" -> ${desiredOn ? 'ON' : 'OFF'} => Shield action=${action} (delivered=${delivered})`,
         )
-
-        // Reset virtual switch state to false after 2s so repeated "ON" routines stay crisp
-        const existing = this.resetTimers.get(light.id)
-        if (existing) clearTimeout(existing)
-        if (light.on) {
-          const t = setTimeout(() => {
-            light.on = false
-            this.resetTimers.delete(light.id)
-          }, 2000)
-          t.unref()
-          this.resetTimers.set(light.id, t)
-        }
       }
 
       if (typeof body.bri === 'number' && Number.isFinite(body.bri)) {

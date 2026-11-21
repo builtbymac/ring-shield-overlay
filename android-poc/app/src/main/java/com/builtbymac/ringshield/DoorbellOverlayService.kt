@@ -71,6 +71,7 @@ class DoorbellOverlayService : Service() {
                 if (connected) {
                     reconnectJob?.cancel()
                     reconnectJob = null
+                    relay.sendOverlayState(overlayManager.isShowing, overlayManager.isFullscreen)
                 } else if (!relay.isStopped) {
                     scheduleReconnect()
                 }
@@ -137,7 +138,13 @@ class DoorbellOverlayService : Service() {
                     triggerOnDemand(startFullscreen = false)
                 }
             }
-            "show" -> triggerOnDemand(startFullscreen = false)
+            "show" -> {
+                if (!overlayManager.isShowing) {
+                    triggerOnDemand(startFullscreen = false)
+                } else if (overlayManager.isFullscreen) {
+                    overlayManager.setFullscreen(false)
+                }
+            }
             "fullscreen" -> {
                 if (overlayManager.isShowing) {
                     overlayManager.setFullscreen(true)
@@ -304,6 +311,9 @@ class DoorbellOverlayService : Service() {
                     },
                     onToggleAudio = {
                         toggleDoorbellAudio()
+                    },
+                    onOverlayStateChanged = { showing, fullscreen ->
+                        relay.sendOverlayState(showing, fullscreen)
                     },
                     onAutoDismiss = {
                         if (!trial.success && trial.error == null) {

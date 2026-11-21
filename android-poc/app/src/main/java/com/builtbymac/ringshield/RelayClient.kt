@@ -170,6 +170,16 @@ class RelayClient(
         }.onFailure { Log.d(TAG, "Thumbnail fetch skipped: ${it.message}") }.getOrNull()
     }
 
+    fun sendOverlayState(showing: Boolean, fullscreen: Boolean) {
+        val socket = ws ?: return
+        val payload = JSONObject().apply {
+            put("kind", "overlay_state")
+            put("showing", showing)
+            put("fullscreen", fullscreen)
+        }.toString()
+        runCatching { socket.send(payload) }
+    }
+
     fun close() {
         stopped = true
         ws?.close(1000, "service_stopped")
