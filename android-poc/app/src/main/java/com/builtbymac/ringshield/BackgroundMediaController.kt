@@ -76,12 +76,12 @@ class BackgroundMediaController(
             // 1. Mute ONLY the Live TV package in AudioFlinger (PLAY_AUDIO ignore) so video never pauses
             onPerAppLiveTvMute(fgPkg, true)
 
-            // 2. Also request non-pausing duck focus as a native fallback
+            // 2. Also request aggressive non-pausing duck focus as a native fallback
             runCatching {
                 val req = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
                     .setAudioAttributes(
                         AudioAttributes.Builder()
-                            .setUsage(AudioAttributes.USAGE_ASSISTANCE_NAVIGATION_GUIDANCE)
+                            .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
                             .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                             .build()
                     )

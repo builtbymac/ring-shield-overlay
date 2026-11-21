@@ -61,28 +61,49 @@ const ADB_BIN =
 const SHIELD_SERIAL = process.env.SHIELD_ADB_SERIAL || '192.168.50.130:5555'
 const mutedLiveTvPackages = new Set<string>()
 
-function setShieldPackageAudioMute(pkg: string, muted: boolean): Promise<void> {
-  if (!/^[a-zA-Z0-9_.]+$/.test(pkg) || pkg === 'com.builtbymac.ringshield') {
-    return Promise.resolve()
-  }
-  const mode = muted ? 'ignore' : 'allow'
-  if (muted) mutedLiveTvPackages.add(pkg)
-  else mutedLiveTvPackages.delete(pkg)
+function connectShieldAdb(): Promise<void> {
+  return new Promise((resolve) => {
+    execFile(ADB_BIN, ['connect', SHIELD_SERIAL], { timeout: 3000 }, (err, stdout) => {
+      if (err) {
+        console.warn(`[audio] adb connect ${SHIELD_SERIAL} failed: ${err.message}`)
+      } else {
+        console.log(`[audio] adb connect ${SHIELD_SERIAL}: ${stdout.trim()}`)
+      }
+      resolve()
+    })
+  })
+}
+
+function runAppOpsPlayAudio(pkg: string, mode: 'ignore' | 'allow'): Promise<Error | null> {
   return new Promise((resolve) => {
     execFile(
       ADB_BIN,
       ['-s', SHIELD_SERIAL, 'shell', 'appops', 'set', pkg, 'PLAY_AUDIO', mode],
       { timeout: 3000 },
-      (err) => {
-        if (err) {
-          console.warn(`[audio] appops set ${pkg} PLAY_AUDIO ${mode} failed: ${err.message}`)
-        } else {
-          console.log(`[audio] Set Live TV package ${pkg} PLAY_AUDIO -> ${mode}`)
-        }
-        resolve()
-      },
+      (err) => resolve(err ?? null),
     )
   })
+}
+
+async function setShieldPackageAudioMute(pkg: string, muted: boolean): Promise<void> {
+  if (!/^[a-zA-Z0-9_.]+$/.test(pkg) || pkg === 'com.builtbymac.ringshield') {
+    return
+  }
+  const mode = muted ? 'ignore' : 'allow'
+  if (muted) mutedLiveTvPackages.add(pkg)
+  else mutedLiveTvPackages.delete(pkg)
+
+  let err = await runAppOpsPlayAudio(pkg, mode)
+  if (err) {
+    // Auto-reconnect ADB over LAN (e.g. after Pi reboot or Shield sleep) and retry once
+    await connectShieldAdb()
+    err = await runAppOpsPlayAudio(pkg, mode)
+  }
+  if (err) {
+    console.warn(`[audio] appops set ${pkg} PLAY_AUDIO ${mode} failed: ${err.message}`)
+  } else {
+    console.log(`[audio] Set Live TV package ${pkg} PLAY_AUDIO -> ${mode}`)
+  }
 }
 
 async function restoreAllMutedLiveTvPackages(): Promise<void> {
@@ -352,6 +373,7 @@ async function main(): Promise<void> {
     console.log(
       `[relay] Listening on http://${cfg.host}:${cfg.port} (authMode=${auth.mode}, defaultDevice=${cfg.defaultDeviceId ?? 'auto'})`,
     )
+    void connectShieldAdb()
   })
 
   const shutdown = () => {

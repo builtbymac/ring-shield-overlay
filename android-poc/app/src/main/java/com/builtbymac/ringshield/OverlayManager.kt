@@ -356,8 +356,14 @@ class OverlayManager(private val context: Context) {
                     KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER -> {
                         when (pipFocusTarget) {
                             PipFocusTarget.CARD -> setFullscreen(true)
-                            PipFocusTarget.AUDIO_BTN -> performAudioToggle()
-                            PipFocusTarget.DISMISS_BTN -> dismissAnimated()
+                            PipFocusTarget.AUDIO_BTN -> {
+                                pipDock?.triggerPressBounce()
+                                performAudioToggle()
+                            }
+                            PipFocusTarget.DISMISS_BTN -> {
+                                pipDock?.triggerPressBounce()
+                                dismissAnimated()
+                            }
                         }
                         true
                     }
@@ -389,9 +395,18 @@ class OverlayManager(private val context: Context) {
                 KeyEvent.KEYCODE_DPAD_UP, KeyEvent.KEYCODE_DPAD_DOWN -> true
                 KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER -> {
                     when (fsFocusTarget) {
-                        FullscreenFocusTarget.AUDIO_BTN -> performAudioToggle()
-                        FullscreenFocusTarget.PIP_BTN -> setFullscreen(false)
-                        FullscreenFocusTarget.DISMISS_BTN -> dismissAnimated()
+                        FullscreenFocusTarget.AUDIO_BTN -> {
+                            fsDock?.triggerPressBounce()
+                            performAudioToggle()
+                        }
+                        FullscreenFocusTarget.PIP_BTN -> {
+                            fsDock?.triggerPressBounce()
+                            setFullscreen(false)
+                        }
+                        FullscreenFocusTarget.DISMISS_BTN -> {
+                            fsDock?.triggerPressBounce()
+                            dismissAnimated()
+                        }
                     }
                     true
                 }
@@ -766,16 +781,21 @@ class OverlayManager(private val context: Context) {
         connectingPulseAnimator?.cancel()
         connectingContainer?.animate()
             ?.alpha(0f)
-            ?.scaleX(0.94f)
-            ?.scaleY(0.94f)
-            ?.setDuration(220L)
+            ?.scaleX(0.88f)
+            ?.scaleY(0.88f)
+            ?.setDuration(240L)
             ?.setInterpolator(exitEase)
             ?.withEndAction { connectingContainer?.visibility = View.GONE }
             ?.start()
 
+        // Optical lens focus-settle reveal: video gently settles from 1.026x -> 1.0x as frost dissolves
+        videoView.scaleX = 1.026f
+        videoView.scaleY = 1.026f
         videoView.animate()
             .alpha(1f)
-            .setDuration(260L)
+            .scaleX(1f)
+            .scaleY(1f)
+            .setDuration(320L)
             .setInterpolator(enterEase)
             .withEndAction {
                 connectingBackdrop?.visibility = View.GONE
@@ -1010,6 +1030,7 @@ class OverlayManager(private val context: Context) {
                         .start()
                 }
                 if (!isFullscreen) {
+                    card.elevation = dp(18).toFloat()
                     card.animate()
                         .scaleX(pip.scaleX)
                         .scaleY(pip.scaleY)
@@ -1046,6 +1067,8 @@ class OverlayManager(private val context: Context) {
         rim.animate().cancel()
         rim.animate().alpha(if (onCard) 1f else 0.50f).setDuration(170L).start()
 
+        // Physical Apple tvOS card elevation lift when focusing the PiP card
+        card.elevation = dp(if (onCard) 26 else 18).toFloat()
         card.animate().cancel()
         card.animate()
             .scaleX(targetScaleX)
@@ -1104,12 +1127,17 @@ class OverlayManager(private val context: Context) {
         private var focusedSlot: Int = -1
         private var audioActive: Boolean = false
 
-        // Smooth 60 fps animated focus highlight position & alpha
+        // Smooth 60 fps animated focus highlight position, stretch, press-bounce, and live audio wave phase
         private var focusSlidePos: Float = 0f
         private var focusAlpha: Float = 0f
+        private var focusStretch: Float = 0f
+        private var pressScale: Float = 1f
+        private var audioWavePhase: Float = 0f
         private var slideAnim: ValueAnimator? = null
         private var alphaAnim: ValueAnimator? = null
-        private val slideEase = PathInterpolator(0.22f, 1f, 0.36f, 1f)
+        private var pressAnim: ValueAnimator? = null
+        private var waveAnim: ValueAnimator? = null
+        private val slideEase = PathInterpolator(0.22f, 1.07f, 0.36f, 1f)
 
         private val dockBgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
         private val dockSheenPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
@@ -1160,7 +1188,46 @@ class OverlayManager(private val context: Context) {
         fun setAudioActive(active: Boolean) {
             if (audioActive == active) return
             audioActive = active
+            if (active) {
+                startAudioWaveLoop()
+            } else {
+                stopAudioWaveLoop()
+            }
             invalidate()
+        }
+
+        fun triggerPressBounce() {
+            pressAnim?.cancel()
+            pressAnim = ValueAnimator.ofFloat(1f, 0.86f, 1f).apply {
+                duration = 150L
+                interpolator = enterEase
+                addUpdateListener {
+                    pressScale = it.animatedValue as Float
+                    invalidate()
+                }
+                start()
+            }
+        }
+
+        private fun startAudioWaveLoop() {
+            if (waveAnim?.isRunning == true) return
+            waveAnim?.cancel()
+            waveAnim = ValueAnimator.ofFloat(0f, (Math.PI * 2.0).toFloat()).apply {
+                duration = 1350L
+                repeatCount = ValueAnimator.INFINITE
+                interpolator = LinearInterpolator()
+                addUpdateListener {
+                    audioWavePhase = it.animatedValue as Float
+                    invalidate()
+                }
+                start()
+            }
+        }
+
+        private fun stopAudioWaveLoop() {
+            waveAnim?.cancel()
+            waveAnim = null
+            audioWavePhase = 0f
         }
 
         fun setFocusedSlot(slot: Int, animated: Boolean) {
@@ -1208,10 +1275,13 @@ class OverlayManager(private val context: Context) {
             } else {
                 focusAlpha = 1f
                 slideAnim = ValueAnimator.ofFloat(focusSlidePos, targetX).apply {
-                    duration = 175L
+                    duration = 190L
                     interpolator = slideEase
                     addUpdateListener {
                         focusSlidePos = it.animatedValue as Float
+                        // Subtle Dynamic-Island horizontal stretch peaking mid-glide
+                        val frac = it.animatedFraction.coerceIn(0f, 1f)
+                        focusStretch = kotlin.math.sin(frac * Math.PI).toFloat() * 0.14f
                         invalidate()
                     }
                     start()
@@ -1224,6 +1294,9 @@ class OverlayManager(private val context: Context) {
             slideAnim = null
             alphaAnim?.cancel()
             alphaAnim = null
+            pressAnim?.cancel()
+            pressAnim = null
+            stopAudioWaveLoop()
         }
 
         private fun slotCenterX(slotPos: Float): Float =
@@ -1323,21 +1396,24 @@ class OverlayManager(private val context: Context) {
                 canvas.drawCircle(ax, cy, slotR - strokeUnitPx * 0.5f, activeBluePaint)
             }
 
-            // 3. Silky 60 fps sliding Apple tvOS focus pill
+            // 3. Silky 60 fps sliding Apple tvOS focus pill (with subtle glide stretch + press bounce)
             if (focusAlpha > 0.01f) {
                 val fx = slotCenterX(focusSlidePos)
                 val overActiveAudio = audioActive && audioSlotIdx >= 0 &&
                     kotlin.math.abs(focusSlidePos - audioSlotIdx.toFloat()) < 0.35f
+                val rx = (slotR - strokeUnitPx * 0.35f) * (1f + focusStretch) * pressScale
+                val ry = (slotR - strokeUnitPx * 0.35f) * (1f - focusStretch * 0.25f) * pressScale
+                rect.set(fx - rx, cy - ry, fx + rx, cy + ry)
                 if (overActiveAudio) {
-                    // Luminous Apple Blue + crisp pure-white outer focus ring
                     activeBluePaint.alpha = 255
-                    canvas.drawCircle(fx, cy, slotR - strokeUnitPx * 0.4f, activeBluePaint)
+                    canvas.drawRoundRect(rect, ry, ry, activeBluePaint)
                     activeBlueFocusRingPaint.alpha = (focusAlpha * 255f).toInt().coerceIn(0, 255)
-                    canvas.drawCircle(fx, cy, slotR - activeBlueFocusRingPaint.strokeWidth * 0.55f, activeBlueFocusRingPaint)
+                    val ri = activeBlueFocusRingPaint.strokeWidth * 0.5f
+                    rect.inset(ri, ri)
+                    canvas.drawRoundRect(rect, ry, ry, activeBlueFocusRingPaint)
                 } else {
-                    // Classic Apple tvOS pure-white elevated focus circle
                     focusFillPaint.alpha = (focusAlpha * 250f).toInt().coerceIn(0, 255)
-                    canvas.drawCircle(fx, cy, slotR - strokeUnitPx * 0.35f, focusFillPaint)
+                    canvas.drawRoundRect(rect, ry, ry, focusFillPaint)
                 }
             }
 
@@ -1442,13 +1518,20 @@ class OverlayManager(private val context: Context) {
 
                     iconStrokePaint.strokeWidth = strokeUnitPx * 1.65f
                     if (audioActive) {
+                        // Subtle staggered live acoustic breathing ripple across the two soundwave arcs
+                        val innerAlpha = (185 + 70 * kotlin.math.sin(audioWavePhase.toDouble())).toInt().coerceIn(120, 255)
+                        val outerAlpha = (165 + 90 * kotlin.math.sin((audioWavePhase - 1.1f).toDouble())).toInt().coerceIn(95, 255)
+
                         val r1 = slotR * 0.24f
+                        iconStrokePaint.alpha = innerAlpha
                         rect.set(spkRight - r1 * 0.25f, cy - r1, spkRight + r1 * 1.35f, cy + r1)
                         canvas.drawArc(rect, -40f, 80f, false, iconStrokePaint)
 
                         val r2 = slotR * 0.42f
+                        iconStrokePaint.alpha = outerAlpha
                         rect.set(spkRight - r2 * 0.25f, cy - r2, spkRight + r2 * 1.35f, cy + r2)
                         canvas.drawArc(rect, -44f, 88f, false, iconStrokePaint)
+                        iconStrokePaint.alpha = 255
                     } else {
                         // SF-Symbols split-slash: subtle knockout gap beside crisp diagonal mute slash
                         val sd = slotR * 0.34f
