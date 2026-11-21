@@ -1139,15 +1139,17 @@ class OverlayManager(private val context: Context) {
         private var focusedSlot: Int = -1
         private var audioActive: Boolean = false
 
-        // Smooth 60 fps animated focus highlight position, stretch, press-bounce, and live audio wave phase
+        // Smooth 60 fps animated focus highlight, press-bounce, audio mute<->unmute morph, and wave phase
         private var focusSlidePos: Float = 0f
         private var focusAlpha: Float = 0f
         private var focusStretch: Float = 0f
         private var pressScale: Float = 1f
+        private var audioMorph: Float = 0f
         private var audioWavePhase: Float = 0f
         private var slideAnim: ValueAnimator? = null
         private var alphaAnim: ValueAnimator? = null
         private var pressAnim: ValueAnimator? = null
+        private var audioMorphAnim: ValueAnimator? = null
         private var waveAnim: ValueAnimator? = null
         private val slideEase = PathInterpolator(0.22f, 1.07f, 0.36f, 1f)
 
@@ -1178,10 +1180,6 @@ class OverlayManager(private val context: Context) {
         private val iconFillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             style = Paint.Style.FILL
         }
-        private val slashCutoutPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            style = Paint.Style.STROKE
-            strokeCap = Paint.Cap.ROUND
-        }
 
         private val rect = RectF()
         private val speakerPath = Path()
@@ -1197,9 +1195,24 @@ class OverlayManager(private val context: Context) {
             clipToOutline = false
         }
 
-        fun setAudioActive(active: Boolean) {
-            if (audioActive == active) return
+        fun setAudioActive(active: Boolean, animated: Boolean = true) {
+            if (audioActive == active && (!animated || audioMorph == (if (active) 1f else 0f))) return
             audioActive = active
+            val target = if (active) 1f else 0f
+            audioMorphAnim?.cancel()
+            if (animated && visibility == View.VISIBLE) {
+                audioMorphAnim = ValueAnimator.ofFloat(audioMorph, target).apply {
+                    duration = 340L
+                    interpolator = enterEase
+                    addUpdateListener {
+                        audioMorph = it.animatedValue as Float
+                        invalidate()
+                    }
+                    start()
+                }
+            } else {
+                audioMorph = target
+            }
             if (active) {
                 startAudioWaveLoop()
             } else {
@@ -1308,6 +1321,8 @@ class OverlayManager(private val context: Context) {
             alphaAnim = null
             pressAnim?.cancel()
             pressAnim = null
+            audioMorphAnim?.cancel()
+            audioMorphAnim = null
             stopAudioWaveLoop()
         }
 
@@ -1399,37 +1414,41 @@ class OverlayManager(private val context: Context) {
             val cy = hf * 0.5f
             val slotR = slotSizePx * 0.5f
 
-            // 2. Active Audio Apple Blue badge (when Audio is ON and NOT currently under the white focus pill,
-            //    or glows beneath the focus ring when focused!)
+            // 2. Animated Apple Blue badge bloom when Audio morphs ON/OFF
             val audioSlotIdx = icons.indexOf(DockIconType.AUDIO_TOGGLE)
-            if (audioActive && audioSlotIdx >= 0) {
+            if (audioMorph > 0.01f && audioSlotIdx >= 0) {
                 val ax = slotCenterX(audioSlotIdx.toFloat())
-                activeBluePaint.alpha = 240
-                canvas.drawCircle(ax, cy, slotR - strokeUnitPx * 0.5f, activeBluePaint)
+                val bloomScale = 0.42f + 0.58f * audioMorph
+                val blueR = (slotR - strokeUnitPx * 0.45f) * bloomScale
+                activeBluePaint.alpha = (242f * audioMorph).toInt().coerceIn(0, 255)
+                canvas.drawCircle(ax, cy, blueR, activeBluePaint)
             }
 
             // 3. Silky 60 fps sliding Apple tvOS focus pill (with subtle glide stretch + press bounce)
             if (focusAlpha > 0.01f) {
                 val fx = slotCenterX(focusSlidePos)
-                val overActiveAudio = audioActive && audioSlotIdx >= 0 &&
+                val overAudioSlot = audioSlotIdx >= 0 &&
                     kotlin.math.abs(focusSlidePos - audioSlotIdx.toFloat()) < 0.35f
+                val blueWeight = if (overAudioSlot) audioMorph else 0f
                 val rx = (slotR - strokeUnitPx * 0.35f) * (1f + focusStretch) * pressScale
                 val ry = (slotR - strokeUnitPx * 0.35f) * (1f - focusStretch * 0.25f) * pressScale
                 rect.set(fx - rx, cy - ry, fx + rx, cy + ry)
-                if (overActiveAudio) {
-                    activeBluePaint.alpha = 255
+
+                if (blueWeight < 0.99f) {
+                    focusFillPaint.alpha = (focusAlpha * (1f - blueWeight) * 250f).toInt().coerceIn(0, 255)
+                    canvas.drawRoundRect(rect, ry, ry, focusFillPaint)
+                }
+                if (blueWeight > 0.01f) {
+                    activeBluePaint.alpha = (focusAlpha * blueWeight * 255f).toInt().coerceIn(0, 255)
                     canvas.drawRoundRect(rect, ry, ry, activeBluePaint)
-                    activeBlueFocusRingPaint.alpha = (focusAlpha * 255f).toInt().coerceIn(0, 255)
+                    activeBlueFocusRingPaint.alpha = (focusAlpha * blueWeight * 255f).toInt().coerceIn(0, 255)
                     val ri = activeBlueFocusRingPaint.strokeWidth * 0.5f
                     rect.inset(ri, ri)
                     canvas.drawRoundRect(rect, ry, ry, activeBlueFocusRingPaint)
-                } else {
-                    focusFillPaint.alpha = (focusAlpha * 250f).toInt().coerceIn(0, 255)
-                    canvas.drawRoundRect(rect, ry, ry, focusFillPaint)
                 }
             }
 
-            // 4. Crisp SF-Symbols-grade icons with smooth focus color inversion
+            // 4. Crisp SF-Symbols-grade icons with smooth focus & audio-morph color inversion
             for (i in icons.indices) {
                 val cx = slotCenterX(i.toFloat())
                 val distToFocus = kotlin.math.abs(focusSlidePos - i.toFloat())
@@ -1437,19 +1456,14 @@ class OverlayManager(private val context: Context) {
                     (1f - (distToFocus / 0.65f).coerceIn(0f, 1f)) * focusAlpha
                 } else 0f
 
-                val isActiveAudioSlot = icons[i] == DockIconType.AUDIO_TOGGLE && audioActive
-                val iconColor = if (isActiveAudioSlot) {
-                    Color.WHITE
+                val baseFocusColor = blendArgb(Color.parseColor("#F0FFFFFF"), Color.parseColor("#FF12161E"), focusWeight)
+                val iconColor = if (icons[i] == DockIconType.AUDIO_TOGGLE) {
+                    blendArgb(baseFocusColor, Color.WHITE, audioMorph)
                 } else {
-                    blendArgb(Color.parseColor("#F0FFFFFF"), Color.parseColor("#FF12161E"), focusWeight)
-                }
-                val cutoutColor = if (isActiveAudioSlot) {
-                    Color.parseColor("#FF0A84FF")
-                } else {
-                    blendArgb(Color.parseColor("#FF161B24"), Color.parseColor("#FAFFFFFF"), focusWeight)
+                    baseFocusColor
                 }
 
-                drawDockIcon(canvas, icons[i], cx, cy, slotR, iconColor, cutoutColor)
+                drawDockIcon(canvas, icons[i], cx, cy, slotR, iconColor)
             }
         }
 
@@ -1460,7 +1474,6 @@ class OverlayManager(private val context: Context) {
             cy: Float,
             slotR: Float,
             fgColor: Int,
-            bgColor: Int,
         ) {
             iconStrokePaint.color = fgColor
             iconFillPaint.color = fgColor
@@ -1508,51 +1521,96 @@ class OverlayManager(private val context: Context) {
                     canvas.drawPath(arrowPath, iconStrokePaint)
                 }
                 DockIconType.AUDIO_TOGGLE -> {
-                    val shiftX = if (audioActive) -slotR * 0.08f else 0f
-                    val spkLeft = cx + shiftX - slotR * 0.37f
-                    val spkMid = cx + shiftX - slotR * 0.19f
-                    val spkRight = cx + shiftX + slotR * 0.05f
-                    val boxHalfH = slotR * 0.15f
-                    val coneHalfH = slotR * 0.35f
+                    val m = audioMorph.coerceIn(0f, 1f)
+                    // Subtle acoustic recoil + pop mid-transition as soundwaves burst out
+                    val punch = kotlin.math.sin(m * Math.PI).toFloat()
+                    val recoilX = -slotR * 0.055f * punch
+                    val spkScale = 1f + 0.11f * punch
+                    val baseShiftX = -slotR * 0.06f
+
+                    // Plump all-corners-rounded speaker silhouette (matches Apple SF Symbols / reference)
+                    canvas.save()
+                    canvas.translate(cx + baseShiftX + recoilX, cy)
+                    canvas.scale(spkScale, spkScale)
+
+                    val spkLeft = -slotR * 0.38f
+                    val spkMid = -slotR * 0.17f
+                    val spkRight = slotR * 0.06f
+                    val boxH = slotR * 0.17f
+                    val coneH = slotR * 0.36f
+                    val rBack = slotR * 0.085f
+                    val rTip = slotR * 0.08f
 
                     speakerPath.reset()
-                    speakerPath.moveTo(spkLeft + strokeUnitPx, cy - boxHalfH)
-                    speakerPath.lineTo(spkMid, cy - boxHalfH)
-                    speakerPath.lineTo(spkRight, cy - coneHalfH)
-                    speakerPath.lineTo(spkRight, cy + coneHalfH)
-                    speakerPath.lineTo(spkMid, cy + boxHalfH)
-                    speakerPath.lineTo(spkLeft + strokeUnitPx, cy + boxHalfH)
-                    speakerPath.quadTo(spkLeft, cy + boxHalfH, spkLeft, cy + boxHalfH - strokeUnitPx)
-                    speakerPath.lineTo(spkLeft, cy - boxHalfH + strokeUnitPx)
-                    speakerPath.quadTo(spkLeft, cy - boxHalfH, spkLeft + strokeUnitPx, cy - boxHalfH)
+                    // Start top edge of box after rounded top-left corner
+                    speakerPath.moveTo(spkLeft + rBack, -boxH)
+                    speakerPath.lineTo(spkMid - rTip * 0.3f, -boxH)
+                    // Smooth flare up to rounded top-right cone tip
+                    speakerPath.lineTo(spkRight - rTip * 1.15f, -coneH + rTip * 0.55f)
+                    speakerPath.quadTo(spkRight, -coneH - rTip * 0.15f, spkRight, -coneH + rTip * 1.15f)
+                    // Straight front face of speaker cone down to rounded bottom-right cone tip
+                    speakerPath.lineTo(spkRight, coneH - rTip * 1.15f)
+                    speakerPath.quadTo(spkRight, coneH + rTip * 0.15f, spkRight - rTip * 1.15f, coneH - rTip * 0.55f)
+                    // Smooth flare back to bottom edge of box
+                    speakerPath.lineTo(spkMid - rTip * 0.3f, boxH)
+                    speakerPath.lineTo(spkLeft + rBack, boxH)
+                    speakerPath.quadTo(spkLeft, boxH, spkLeft, boxH - rBack)
+                    speakerPath.lineTo(spkLeft, -boxH + rBack)
+                    speakerPath.quadTo(spkLeft, -boxH, spkLeft + rBack, -boxH)
                     speakerPath.close()
                     canvas.drawPath(speakerPath, iconFillPaint)
+                    canvas.restore()
 
-                    iconStrokePaint.strokeWidth = strokeUnitPx * 1.65f
-                    if (audioActive) {
-                        // Subtle staggered live acoustic breathing ripple across the two soundwave arcs
-                        val innerAlpha = (185 + 70 * kotlin.math.sin(audioWavePhase.toDouble())).toInt().coerceIn(120, 255)
-                        val outerAlpha = (165 + 90 * kotlin.math.sin((audioWavePhase - 1.1f).toDouble())).toInt().coerceIn(95, 255)
+                    val spkFaceX = cx + baseShiftX + slotR * 0.06f
+                    val baseAlpha = Color.alpha(fgColor)
 
-                        val r1 = slotR * 0.24f
-                        iconStrokePaint.alpha = innerAlpha
-                        rect.set(spkRight - r1 * 0.25f, cy - r1, spkRight + r1 * 1.35f, cy + r1)
-                        canvas.drawArc(rect, -40f, 80f, false, iconStrokePaint)
-
-                        val r2 = slotR * 0.42f
-                        iconStrokePaint.alpha = outerAlpha
-                        rect.set(spkRight - r2 * 0.25f, cy - r2, spkRight + r2 * 1.35f, cy + r2)
-                        canvas.drawArc(rect, -44f, 88f, false, iconStrokePaint)
-                        iconStrokePaint.alpha = 255
-                    } else {
-                        // SF-Symbols split-slash: subtle knockout gap beside crisp diagonal mute slash
-                        val sd = slotR * 0.34f
-                        val gap = strokeUnitPx * 1.55f
-                        slashCutoutPaint.color = bgColor
-                        slashCutoutPaint.strokeWidth = strokeUnitPx * 2.1f
-                        canvas.drawLine(cx - sd + gap, cy - sd - gap, cx + sd + gap, cy + sd - gap, slashCutoutPaint)
-                        canvas.drawLine(cx - sd, cy - sd, cx + sd, cy + sd, iconStrokePaint)
+                    // 1. Muted '×' on right side: twists 50° & collapses away cleanly during 0.0 -> 0.46
+                    if (m < 0.48f) {
+                        val xProgress = (1f - (m / 0.46f)).coerceIn(0f, 1f)
+                        val xScale = xProgress * (0.85f + 0.15f * xProgress)
+                        val xRotDeg = (1f - xProgress) * 50f
+                        val xCx = cx + slotR * 0.25f
+                        val xHalf = slotR * 0.165f * xScale
+                        iconStrokePaint.strokeWidth = strokeUnitPx * 1.85f
+                        iconStrokePaint.alpha = (baseAlpha * xProgress).toInt().coerceIn(0, 255)
+                        canvas.save()
+                        canvas.translate(xCx, cy)
+                        canvas.rotate(xRotDeg)
+                        canvas.drawLine(-xHalf, -xHalf, xHalf, xHalf, iconStrokePaint)
+                        canvas.drawLine(xHalf, -xHalf, -xHalf, xHalf, iconStrokePaint)
+                        canvas.restore()
                     }
+
+                    // 2. Unmuted soundwaves: cascade outward from speaker face (inner 0.28..0.78, outer 0.46..1.0)
+                    if (m > 0.28f) {
+                        iconStrokePaint.strokeWidth = strokeUnitPx * 1.65f
+                        val t1 = ((m - 0.28f) / 0.50f).coerceIn(0f, 1f)
+                        val t2 = ((m - 0.46f) / 0.54f).coerceIn(0f, 1f)
+
+                        // Calm live acoustic breathing ripple once settled at m == 1
+                        val waveBreath1 = if (m > 0.95f) {
+                            (185 + 70 * kotlin.math.sin(audioWavePhase.toDouble())).toFloat() / 255f
+                        } else 1f
+                        val waveBreath2 = if (m > 0.95f) {
+                            (165 + 90 * kotlin.math.sin((audioWavePhase - 1.1f).toDouble())).toFloat() / 255f
+                        } else 1f
+
+                        if (t1 > 0.01f) {
+                            val r1 = slotR * 0.24f * (0.55f + 0.45f * t1)
+                            val sweep1 = 80f * t1
+                            iconStrokePaint.alpha = (baseAlpha * t1 * waveBreath1).toInt().coerceIn(0, 255)
+                            rect.set(spkFaceX - r1 * 0.25f, cy - r1, spkFaceX + r1 * 1.35f, cy + r1)
+                            canvas.drawArc(rect, -sweep1 * 0.5f, sweep1, false, iconStrokePaint)
+                        }
+                        if (t2 > 0.01f) {
+                            val r2 = slotR * 0.42f * (0.64f + 0.36f * t2)
+                            val sweep2 = 88f * t2
+                            iconStrokePaint.alpha = (baseAlpha * t2 * waveBreath2).toInt().coerceIn(0, 255)
+                            rect.set(spkFaceX - r2 * 0.25f, cy - r2, spkFaceX + r2 * 1.35f, cy + r2)
+                            canvas.drawArc(rect, -sweep2 * 0.5f, sweep2, false, iconStrokePaint)
+                        }
+                    }
+                    iconStrokePaint.alpha = 255
                 }
             }
         }
