@@ -112,7 +112,7 @@ class WebRtcEngine(
         )
         val rtcConfig = PeerConnection.RTCConfiguration(iceServers).apply {
             sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN
-            bundlePolicy = PeerConnection.BundlePolicy.MAX_BUNDLE
+            bundlePolicy = PeerConnection.BundlePolicy.MAXBUNDLE
             continualGatheringPolicy = PeerConnection.ContinualGatheringPolicy.GATHER_ONCE
         }
 
