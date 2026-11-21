@@ -75,30 +75,24 @@ test('AlexaHueBridge handles pairing, device discovery, and Shield command dispa
     assert.equal(off1.status, 200)
     assert.deepEqual(dispatched, ['show', 'fullscreen', 'dismiss'])
 
-    // 7. Two-way sync from Shield Pro updates Hue lights accurately
+    // 7. Momentary mode: GET polls always report `on: false` so Alexa never caches a stale "On"
+    // state and every future Routine run always dispatches PUT {"on": true}.
     bridge.syncOverlayState(true, true)
-    let stateCheck = (await (await fetch(`${base}/api/${user}/lights`)).json()) as Record<
-      string,
-      { state: { on: boolean } }
-    >
-    assert.equal(stateCheck['1'].state.on, true)
-    assert.equal(stateCheck['2'].state.on, true)
-
-    bridge.syncOverlayState(true, false)
-    stateCheck = (await (await fetch(`${base}/api/${user}/lights`)).json()) as Record<
-      string,
-      { state: { on: boolean } }
-    >
-    assert.equal(stateCheck['1'].state.on, true)
-    assert.equal(stateCheck['2'].state.on, false)
-
-    bridge.syncOverlayState(false, false)
-    stateCheck = (await (await fetch(`${base}/api/${user}/lights`)).json()) as Record<
+    const stateCheck = (await (await fetch(`${base}/api/${user}/lights`)).json()) as Record<
       string,
       { state: { on: boolean } }
     >
     assert.equal(stateCheck['1'].state.on, false)
     assert.equal(stateCheck['2'].state.on, false)
+
+    // 8. Brightness-only PUT also triggers onAction
+    const bri2 = await fetch(`${base}/api/${user}/lights/2/state`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ bri: 254 }),
+    })
+    assert.equal(bri2.status, 200)
+    assert.deepEqual(dispatched, ['show', 'fullscreen', 'dismiss', 'fullscreen'])
   } finally {
     bridge.stop()
     server.close()

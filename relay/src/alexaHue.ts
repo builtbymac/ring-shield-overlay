@@ -100,6 +100,8 @@ export class AlexaHueBridge {
         }
       })
     })
+    this.httpServer.keepAliveTimeout = 65_000
+    this.httpServer.headersTimeout = 66_000
 
     await new Promise<void>((resolve) => {
       const srv = this.httpServer!
@@ -121,17 +123,14 @@ export class AlexaHueBridge {
     })
   }
 
-  /** Keeps virtual Hue light states synced 1:1 with the real overlay state on the Shield Pro. */
-  syncOverlayState(showing: boolean, fullscreen: boolean): void {
-    const viewLight = this.lights.get('1')
-    const fsLight = this.lights.get('2')
-    if (viewLight) {
-      // "Front Door View" is ON whenever any doorbell overlay (PiP or Fullscreen) is visible
-      viewLight.on = showing
-    }
-    if (fsLight) {
-      // "Front Door Fullscreen" is ON only when Theater Fullscreen is visible
-      fsLight.on = showing && fullscreen
+  /**
+   * Momentary push-button mode: virtual Hue lights always report `on: false` on GET polls so
+   * Alexa never caches a stale "On" state (which causes Hue v1 Routines to skip future "Turn On"
+   * PUTs and leaves the Alexa phone app stuck showing the light as "On").
+   */
+  syncOverlayState(_showing: boolean, _fullscreen: boolean): void {
+    for (const light of this.lights.values()) {
+      light.on = false
     }
   }
 
@@ -222,26 +221,31 @@ export class AlexaHueBridge {
       const body = raw ? (JSON.parse(raw) as Record<string, unknown>) : {}
       const results: Array<{ success: Record<string, unknown> }> = []
 
+      let dispatchedAction: OverlayCommandAction | null = null
+
       if (typeof body.on === 'boolean') {
         const desiredOn = body.on
-        const action = desiredOn ? light.onAction : light.offAction
-        if (!desiredOn) {
-          this.syncOverlayState(false, false)
-        } else if (light.id === '2') {
-          this.syncOverlayState(true, true)
-        } else {
-          this.syncOverlayState(true, false)
-        }
+        // Return the requested state in the PUT confirmation so Alexa succeeds, while keeping
+        // the stored virtual switch `on = false` (momentary trigger) so follow-up GET polls
+        // never leave Alexa stuck in a cached "On" state.
+        light.on = false
         results.push({ success: { [`/lights/${light.id}/state/on`]: desiredOn } })
-        const delivered = this.hub.broadcastCommand(action)
-        console.log(
-          `[alexa-hue] "${light.name}" -> ${desiredOn ? 'ON' : 'OFF'} => Shield action=${action} (delivered=${delivered})`,
-        )
+        dispatchedAction = desiredOn ? light.onAction : light.offAction
       }
 
       if (typeof body.bri === 'number' && Number.isFinite(body.bri)) {
         light.bri = Math.max(1, Math.min(254, Math.round(body.bri)))
         results.push({ success: { [`/lights/${light.id}/state/bri`]: light.bri } })
+        if (!dispatchedAction && light.bri > 0) {
+          dispatchedAction = light.onAction
+        }
+      }
+
+      if (dispatchedAction) {
+        const delivered = this.hub.broadcastCommand(dispatchedAction)
+        console.log(
+          `[alexa-hue] "${light.name}" (${JSON.stringify(body)}) => Shield action=${dispatchedAction} (delivered=${delivered})`,
+        )
       }
 
       if (results.length === 0) {
