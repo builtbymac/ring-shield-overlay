@@ -11,7 +11,6 @@ import android.graphics.Outline
 import android.graphics.Paint
 import android.graphics.Path
 import android.graphics.PixelFormat
-import android.graphics.RadialGradient
 import android.graphics.RectF
 import android.graphics.Shader
 import android.graphics.Typeface
@@ -19,12 +18,10 @@ import android.graphics.drawable.GradientDrawable
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
-import android.os.SystemClock
 import android.provider.Settings
 import android.util.DisplayMetrics
 import android.util.Log
 import android.util.TypedValue
-import android.view.Choreographer
 import android.view.Gravity
 import android.view.KeyEvent
 import android.view.MotionEvent
@@ -41,21 +38,23 @@ import android.widget.TextView
 import org.webrtc.EglBase
 
 /**
- * Apple visionOS / tvOS Liquid Glass 60 fps interactive PiP & 88% Theater Card overlay.
+ * Apple tvOS-grade 60 fps interactive PiP & 88% Rounded Theater Card overlay.
  *
- * Interaction model:
- *  - Corner PiP (Un-hovered): 100% pure video card with 20s auto-dismiss timer.
+ * Visual & interaction design:
+ *  - Connecting Preview: Silky frosted Gaussian blur of the last captured doorbell snapshot
+ *    behind a compact translucent Liquid Glass "Connecting…" pill with a rotating glass arc spinner.
+ *  - Corner PiP (Un-hovered): 100% pure live video card with 20s auto-dismiss timer.
  *  - Corner PiP (Hovered):
- *      • Auto-dismiss is cancelled (stays on until dismissed).
- *      • When hovering the PiP card itself (CARD target), the card subtly swells (1.036x) with a
- *        directional Liquid Glass specular rim highlight — indicating it can be clicked to open
- *        Fullscreen with zero bottom-left button clutter.
- *      • Two circular Liquid Glass orbs (`Audio Mute/Unmute` and `✕ Close`) animate into the
- *        top-right corner. Pressing Right/Up moves focus onto `Audio`, then `✕`.
+ *      • Auto-dismiss cancelled (keep-alive engaged).
+ *      • Focusing the PiP card subtly swells it (1.032x) with a specular rim highlight (click -> Fullscreen).
+ *      • A sleek dark smoked-glass Apple tvOS control capsule (`[ Audio | ✕ ]`) glides smoothly into
+ *        the top-right corner with a 60 fps sliding white focus pill and crisp dark-icon inversion.
  *  - 88% Rounded Theater Fullscreen:
- *      • Background content stays at 100% full brightness (zero background dimming).
- *      • Three compact circular Liquid Glass icon orbs (`Audio Mute/Unmute`, `PiP Minimize`, and
- *        `✕ Close`) sit in the top-right corner of the card and expand smoothly when focused.
+ *      • Zero background dimming.
+ *      • Sleek dark smoked-glass Apple tvOS control capsule (`[ Audio | PiP | ✕ ]`) in the top-right
+ *        corner with razor contrast over both blazing white daytime sky and pitch-black night.
+ *      • Returning to PiP fades the fullscreen dock out cleanly before the card shrinks (zero glitches)
+ *        and preserves keep-alive so the PiP stays on screen until dismissed.
  */
 class OverlayManager(private val context: Context) {
 
@@ -71,7 +70,7 @@ class OverlayManager(private val context: Context) {
         DISMISS_BTN,
     }
 
-    private enum class GlassIconType {
+    private enum class DockIconType {
         AUDIO_TOGGLE,
         PIP_MINIMIZE,
         CLOSE_X,
@@ -79,10 +78,10 @@ class OverlayManager(private val context: Context) {
 
     private val wm = context.getSystemService(Context.WINDOW_SERVICE) as WindowManager
     private val mainHandler = Handler(Looper.getMainLooper())
-    private val enterEase = PathInterpolator(0.25f, 0.9f, 0.25f, 1f)
+    private val enterEase = PathInterpolator(0.22f, 1f, 0.36f, 1f)
     private val morphEase = PathInterpolator(0.32f, 0.72f, 0f, 1f)
     private val exitEase = PathInterpolator(0.4f, 0f, 0.2f, 1f)
-    private val popSpring = OvershootInterpolator(1.45f)
+    private val popSpring = OvershootInterpolator(1.25f)
 
     private var hostWindow: FrameLayout? = null
     private var cardView: FrameLayout? = null
@@ -99,35 +98,13 @@ class OverlayManager(private val context: Context) {
     private var connectingPulseAnimator: ValueAnimator? = null
     private var hasFirstFrame: Boolean = false
 
-    private var glassSyncUntilMs: Long = 0L
-    private var glassSyncRunning: Boolean = false
-    private val glassSyncFrameCallback = object : Choreographer.FrameCallback {
-        override fun doFrame(frameTimeNanos: Long) {
-            if (!isShowing || hostWindow == null) {
-                glassSyncRunning = false
-                return
-            }
-            syncGlassOrbUniforms()
-            if (SystemClock.uptimeMillis() < glassSyncUntilMs) {
-                Choreographer.getInstance().postFrameCallback(this)
-            } else {
-                glassSyncRunning = false
-            }
-        }
-    }
-
     private var glassRimView: LiquidGlassRimView? = null
 
-    // PiP top-right Liquid Glass orbs (`Audio` + `✕`)
-    private var pipTopRightRow: LinearLayout? = null
-    private var pipAudioOrb: LiquidGlassOrbButton? = null
-    private var pipCloseOrb: LiquidGlassOrbButton? = null
-
-    // Fullscreen top-right Liquid Glass orbs (`Audio` + `PiP Minimize` + `✕`)
-    private var fsTopRightRow: LinearLayout? = null
-    private var fsAudioOrb: LiquidGlassOrbButton? = null
-    private var fsPipOrb: LiquidGlassOrbButton? = null
-    private var fsCloseOrb: LiquidGlassOrbButton? = null
+    // Sleek dark smoked-glass Apple tvOS control docks (PiP: 2 slots, Fullscreen: 3 slots)
+    private var pipDock: SmokedGlassControlDock? = null
+    private var fsDock: SmokedGlassControlDock? = null
+    private var pipDockSlidePx: Float = 0f
+    private var fsDockSlidePx: Float = 0f
 
     private var dotAnimator: ObjectAnimator? = null
     private var cornerAnimator: ValueAnimator? = null
@@ -245,7 +222,7 @@ class OverlayManager(private val context: Context) {
             }
         }
 
-        // Frosted Liquid Glass connecting backdrop showing the blurred last doorbell thumbnail
+        // 1. Frosted Liquid Glass connecting backdrop showing blurred last doorbell thumbnail
         val backdrop = buildConnectingBackdrop()
         connectingBackdrop = backdrop
         card.addView(
@@ -256,6 +233,7 @@ class OverlayManager(private val context: Context) {
             )
         )
 
+        // 2. Live WebRTC GPU video surface
         val videoView = TextureViewRenderer(context).apply {
             alpha = 0f
             init(
@@ -271,7 +249,6 @@ class OverlayManager(private val context: Context) {
                 },
             )
         }
-
         card.addView(
             videoView,
             FrameLayout.LayoutParams(
@@ -281,6 +258,7 @@ class OverlayManager(private val context: Context) {
             )
         )
 
+        // 3. Compact translucent Liquid Glass "Connecting…" pill
         val connectingView = buildConnectingIndicator(if (startFullscreen) exp.scaleX else pip.scaleX)
         connectingContainer = connectingView
         card.addView(connectingView)
@@ -289,7 +267,8 @@ class OverlayManager(private val context: Context) {
             card.addView(buildSubtleLiveDot(pip.scaleX))
         }
 
-        buildLiquidGlassHud(card, pip, exp, startFullscreen)
+        // 4. Apple tvOS dark smoked-glass HUD docks & specular card rim
+        buildControlHud(card, pip, exp, startFullscreen)
 
         host.addView(card, FrameLayout.LayoutParams(screenW, screenH, Gravity.TOP or Gravity.START))
 
@@ -313,8 +292,6 @@ class OverlayManager(private val context: Context) {
         renderer = videoView
 
         host.requestFocus()
-        card.post { startGlassOrbSyncBurst(450L) }
-
         animateCardEntrance(card, pip, startFullscreen)
 
         scheduleAutoDismiss(
@@ -392,7 +369,6 @@ class OverlayManager(private val context: Context) {
                 }
             }
         } else {
-            // 88% Rounded Theater Fullscreen Mode
             return when (keyCode) {
                 KeyEvent.KEYCODE_DPAD_LEFT -> {
                     when (fsFocusTarget) {
@@ -410,10 +386,7 @@ class OverlayManager(private val context: Context) {
                     }
                     true
                 }
-                KeyEvent.KEYCODE_DPAD_UP, KeyEvent.KEYCODE_DPAD_DOWN -> {
-                    updateFullscreenHudStyles(animated = true)
-                    true
-                }
+                KeyEvent.KEYCODE_DPAD_UP, KeyEvent.KEYCODE_DPAD_DOWN -> true
                 KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER -> {
                     when (fsFocusTarget) {
                         FullscreenFocusTarget.AUDIO_BTN -> performAudioToggle()
@@ -435,12 +408,10 @@ class OverlayManager(private val context: Context) {
         engageKeepAlive()
         val active = onToggleAudioCallback?.invoke() ?: !isAudioActive
         isAudioActive = active
-        pipAudioOrb?.setActiveToggleState(active)
-        fsAudioOrb?.setActiveToggleState(active)
-        startGlassOrbSyncBurst(220L)
+        pipDock?.setAudioActive(active)
+        fsDock?.setAudioActive(active)
     }
 
-    /** Updates the frosted connecting preview if a fresh Ring activity thumbnail arrives before frame 1. */
     fun updateFrostedPreview(frostedBitmap: Bitmap) {
         mainHandler.post {
             val img = connectingPreviewImage ?: return@post
@@ -451,7 +422,6 @@ class OverlayManager(private val context: Context) {
         }
     }
 
-    /** Captures a clean 640x360 snapshot from the live video TextureView (only once video is visible). */
     fun captureSnapshotBitmap(): Bitmap? {
         val r = renderer ?: return null
         if (!isShowing || !hasFirstFrame || !r.isAvailable) return null
@@ -517,34 +487,49 @@ class OverlayManager(private val context: Context) {
             card.pivotY = 0f
 
             if (expand) {
+                // 1. Cleanly dismiss PiP dock immediately before card grows (prevents scale distortion)
                 isPipHovered = false
-                pipTopRightRow?.animate()?.cancel()
-                pipTopRightRow?.animate()
-                    ?.alpha(0f)
-                    ?.scaleX(0.7f)
-                    ?.scaleY(0.7f)
-                    ?.setDuration(150L)
-                    ?.start()
+                pipFocusTarget = PipFocusTarget.CARD
+                pipDock?.let { dock ->
+                    dock.animate().cancel()
+                    dock.setFocusedSlot(-1, animated = false)
+                    if (dock.visibility == View.VISIBLE) {
+                        dock.animate()
+                            .alpha(0f)
+                            .setDuration(80L)
+                            .setInterpolator(exitEase)
+                            .withEndAction {
+                                if (isFullscreen) {
+                                    dock.visibility = View.GONE
+                                    dock.translationY = -pipDockSlidePx
+                                }
+                            }
+                            .start()
+                    }
+                }
 
+                // 2. Stage Fullscreen dock to glide in gracefully once the card has opened up
                 fsFocusTarget = FullscreenFocusTarget.PIP_BTN
-                updateFullscreenHudStyles(animated = false)
-                fsTopRightRow?.apply {
-                    visibility = View.VISIBLE
-                    animate().cancel()
-                    scaleX = 0.82f
-                    scaleY = 0.82f
-                    animate()
+                fsDock?.let { dock ->
+                    dock.animate().cancel()
+                    dock.setAudioActive(isAudioActive)
+                    dock.setFocusedSlot(1, animated = false)
+                    dock.alpha = 0f
+                    dock.translationY = -fsDockSlidePx
+                    dock.visibility = View.VISIBLE
+                    dock.animate()
                         .alpha(1f)
-                        .scaleX(1f)
-                        .scaleY(1f)
-                        .setDuration(300L)
-                        .setInterpolator(popSpring)
+                        .translationY(0f)
+                        .setStartDelay(150L)
+                        .setDuration(220L)
+                        .setInterpolator(enterEase)
                         .start()
                 }
 
                 glassRimView?.apply {
-                    setStrokeState(pipDp(1, exp.scaleX).toFloat(), bright = false)
-                    animate().alpha(0.75f).setDuration(260L).start()
+                    setStrokeState(expDp(1, exp.scaleX).toFloat(), bright = false)
+                    animate().cancel()
+                    animate().alpha(0.70f).setDuration(260L).start()
                 }
 
                 card.elevation = dp(28).toFloat()
@@ -555,26 +540,43 @@ class OverlayManager(private val context: Context) {
                     .scaleY(exp.scaleY)
                     .translationX(exp.x)
                     .translationY(exp.y)
-                    .setDuration(420L)
+                    .setDuration(400L)
                     .setInterpolator(morphEase)
                     .start()
-                startGlassOrbSyncBurst(460L)
             } else {
-                fsTopRightRow?.apply {
-                    animate().cancel()
-                    animate()
+                // 1. Fade Fullscreen dock out crisply BEFORE the card shrinks (no shrinking-ant glitch!)
+                fsDock?.let { dock ->
+                    dock.animate().cancel()
+                    dock.animate()
                         .alpha(0f)
-                        .scaleX(0.8f)
-                        .scaleY(0.8f)
-                        .setDuration(180L)
+                        .setStartDelay(0L)
+                        .setDuration(85L)
                         .setInterpolator(exitEase)
-                        .withEndAction { visibility = View.GONE }
+                        .withEndAction {
+                            if (!isFullscreen) {
+                                dock.visibility = View.GONE
+                                dock.translationY = -fsDockSlidePx
+                            }
+                        }
                         .start()
                 }
 
+                // 2. Reset PiP dock cleanly to ready hidden state (next D-pad tap reveals it cleanly)
                 isPipHovered = false
-                pipTopRightRow?.alpha = 0f
-                glassRimView?.animate()?.alpha(0f)?.setDuration(200L)?.start()
+                pipFocusTarget = PipFocusTarget.CARD
+                pipDock?.let { dock ->
+                    dock.animate().cancel()
+                    dock.setAudioActive(isAudioActive)
+                    dock.setFocusedSlot(-1, animated = false)
+                    dock.alpha = 0f
+                    dock.translationY = -pipDockSlidePx
+                    dock.visibility = View.GONE
+                }
+
+                glassRimView?.apply {
+                    animate().cancel()
+                    animate().alpha(0f).setDuration(160L).start()
+                }
 
                 card.elevation = dp(18).toFloat()
                 animateCornerRadius(card, currentCornerRadiusPx, pip.unscaledCornerRadius, 360L)
@@ -584,10 +586,9 @@ class OverlayManager(private val context: Context) {
                     .scaleY(pip.scaleY)
                     .translationX(pip.x)
                     .translationY(pip.y)
-                    .setDuration(380L)
+                    .setDuration(360L)
                     .setInterpolator(morphEase)
                     .start()
-                startGlassOrbSyncBurst(420L)
             }
         }
     }
@@ -609,6 +610,8 @@ class OverlayManager(private val context: Context) {
             card.animate().cancel()
             video?.animate()?.cancel()
             cornerAnimator?.cancel()
+            pipDock?.animate()?.cancel()
+            fsDock?.animate()?.cancel()
 
             video?.animate()?.alpha(0f)?.setDuration(240L)?.setInterpolator(exitEase)?.start()
 
@@ -664,9 +667,8 @@ class OverlayManager(private val context: Context) {
         dotAnimator = null
         connectingPulseAnimator?.cancel()
         connectingPulseAnimator = null
-        glassSyncRunning = false
-        glassSyncUntilMs = 0L
-        runCatching { Choreographer.getInstance().removeFrameCallback(glassSyncFrameCallback) }
+        pipDock?.cancelAnimations()
+        fsDock?.cancelAnimations()
         onDismissCallback = null
         onKeepAliveCallback = null
         onToggleAudioCallback = null
@@ -685,13 +687,8 @@ class OverlayManager(private val context: Context) {
         connectingContainer = null
         hasFirstFrame = false
         glassRimView = null
-        pipTopRightRow = null
-        pipAudioOrb = null
-        pipCloseOrb = null
-        fsTopRightRow = null
-        fsAudioOrb = null
-        fsPipOrb = null
-        fsCloseOrb = null
+        pipDock = null
+        fsDock = null
         isShowing = false
         isFullscreen = false
         isKeepAlive = false
@@ -766,7 +763,6 @@ class OverlayManager(private val context: Context) {
     private fun revealVideoOnFirstFrame(videoView: TextureViewRenderer) {
         val cfg = currentCfg ?: return
         hasFirstFrame = true
-        syncGlassOrbUniforms()
         connectingPulseAnimator?.cancel()
         connectingContainer?.animate()
             ?.alpha(0f)
@@ -817,7 +813,6 @@ class OverlayManager(private val context: Context) {
         connectingPreviewImage = img
         container.addView(img)
 
-        // Subtle Apple Liquid Glass frost veil (specular diagonal light + gentle glass sheen)
         val veil = LiquidGlassFrostVeilView(context).apply {
             layoutParams = FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT,
@@ -829,7 +824,6 @@ class OverlayManager(private val context: Context) {
     }
 
     private fun buildConnectingIndicator(activeScale: Float): View {
-        // Sleek compact translucent Apple Liquid Glass pill tightly wrapping the spinner + label
         val row = LiquidGlassPillLayout(
             context = context,
             strokeWidthPx = expDp(1, activeScale).toFloat() * 1.45f,
@@ -880,7 +874,7 @@ class OverlayManager(private val context: Context) {
         return row
     }
 
-    private fun buildLiquidGlassHud(
+    private fun buildControlHud(
         card: FrameLayout,
         pip: PipTransform,
         exp: PipTransform,
@@ -889,13 +883,13 @@ class OverlayManager(private val context: Context) {
         val pipS = pip.scaleX.coerceAtLeast(0.15f)
         val expS = exp.scaleX.coerceAtLeast(0.5f)
 
-        // 1. Directional Liquid Glass Specular Rim around card
+        // 1. Subtle specular rim around the card
         val rim = LiquidGlassRimView(context).apply {
             setStrokeState(
                 strokeWidthPx = if (startFullscreen) expDp(1, expS).toFloat() else pipDp(2, pipS).toFloat(),
                 bright = false,
             )
-            alpha = if (startFullscreen) 0.75f else 0f
+            alpha = if (startFullscreen) 0.70f else 0f
             layoutParams = FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT,
                 FrameLayout.LayoutParams.MATCH_PARENT,
@@ -904,171 +898,88 @@ class OverlayManager(private val context: Context) {
         glassRimView = rim
         card.addView(rim)
 
-        // 2. Corner PiP Top-Right Liquid Glass Orbs (`Audio Mute/Unmute` + `✕ Close`)
-        val pipOrbSize = pipDp(36, pipS)
-        val pipOrbGap = pipDp(10, pipS)
-        val pipOrbMargin = pipDp(10, pipS)
-        val pipPad = pipDp(5, pipS)
-
-        val pipRow = LinearLayout(context).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            clipChildren = false
-            clipToPadding = false
-            setPadding(pipPad, pipPad, pipPad, pipPad)
+        // 2. Corner PiP Top-Right Dark Smoked Glass Capsule Dock (`[ Audio | ✕ ]`)
+        val pipMargin = pipDp(12, pipS)
+        pipDockSlidePx = pipDp(6, pipS).toFloat()
+        val pDock = SmokedGlassControlDock(
+            context = context,
+            icons = listOf(DockIconType.AUDIO_TOGGLE, DockIconType.CLOSE_X),
+            slotSizePx = pipDp(34, pipS).toFloat(),
+            slotGapPx = pipDp(4, pipS).toFloat(),
+            dockPadPx = pipDp(4, pipS).toFloat(),
+            strokeUnitPx = pipDp(1, pipS).toFloat(),
+            onSlotHovered = { idx ->
+                if (!isFullscreen && !isHiding) {
+                    val target = if (idx == 0) PipFocusTarget.AUDIO_BTN else PipFocusTarget.DISMISS_BTN
+                    setPipHovered(true, target)
+                }
+            },
+            onSlotClicked = { idx ->
+                if (!isHiding) {
+                    if (idx == 0) performAudioToggle() else dismissAnimated()
+                }
+            },
+        ).apply {
             alpha = 0f
-            scaleX = 0.7f
-            scaleY = 0.7f
+            translationY = -pipDockSlidePx
+            visibility = View.GONE
+            elevation = pipDp(6, pipS).toFloat()
             layoutParams = FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.WRAP_CONTENT,
                 FrameLayout.LayoutParams.WRAP_CONTENT,
                 Gravity.TOP or Gravity.END,
             ).apply {
-                setMargins(0, pipOrbMargin, pipOrbMargin, 0)
+                setMargins(0, pipMargin, pipMargin, 0)
             }
         }
-        pipTopRightRow = pipRow
+        pipDock = pDock
+        card.addView(pDock)
 
-        val pAudioOrb = LiquidGlassOrbButton(
+        // 3. Fullscreen Top-Right Dark Smoked Glass Capsule Dock (`[ Audio | PiP | ✕ ]`)
+        val fsMargin = expDp(20, expS)
+        fsDockSlidePx = expDp(8, expS).toFloat()
+        val fDock = SmokedGlassControlDock(
             context = context,
-            iconType = GlassIconType.AUDIO_TOGGLE,
-            strokeScalePx = pipDp(1, pipS).toFloat(),
+            icons = listOf(DockIconType.AUDIO_TOGGLE, DockIconType.PIP_MINIMIZE, DockIconType.CLOSE_X),
+            slotSizePx = expDp(42, expS).toFloat(),
+            slotGapPx = expDp(5, expS).toFloat(),
+            dockPadPx = expDp(5, expS).toFloat(),
+            strokeUnitPx = expDp(1, expS).toFloat(),
+            onSlotHovered = { idx ->
+                if (isFullscreen && !isHiding) {
+                    val target = when (idx) {
+                        0 -> FullscreenFocusTarget.AUDIO_BTN
+                        1 -> FullscreenFocusTarget.PIP_BTN
+                        else -> FullscreenFocusTarget.DISMISS_BTN
+                    }
+                    setFullscreenFocusTarget(target)
+                }
+            },
+            onSlotClicked = { idx ->
+                if (isFullscreen && !isHiding) {
+                    when (idx) {
+                        0 -> performAudioToggle()
+                        1 -> setFullscreen(false)
+                        else -> dismissAnimated()
+                    }
+                }
+            },
         ).apply {
-            layoutParams = LinearLayout.LayoutParams(pipOrbSize, pipOrbSize).apply {
-                rightMargin = pipOrbGap
-            }
-            setOnHoverListener { _, ev ->
-                if (!isFullscreen && !isHiding && ev.actionMasked == MotionEvent.ACTION_HOVER_ENTER) {
-                    setPipHovered(true, PipFocusTarget.AUDIO_BTN)
-                }
-                false
-            }
-            setOnClickListener {
-                if (!isHiding) {
-                    performAudioToggle()
-                }
-            }
-        }
-        pipAudioOrb = pAudioOrb
-
-        val pCloseOrb = LiquidGlassOrbButton(
-            context = context,
-            iconType = GlassIconType.CLOSE_X,
-            strokeScalePx = pipDp(1, pipS).toFloat(),
-        ).apply {
-            layoutParams = LinearLayout.LayoutParams(pipOrbSize, pipOrbSize)
-            setOnHoverListener { _, ev ->
-                if (!isFullscreen && !isHiding && ev.actionMasked == MotionEvent.ACTION_HOVER_ENTER) {
-                    setPipHovered(true, PipFocusTarget.DISMISS_BTN)
-                }
-                false
-            }
-            setOnClickListener {
-                if (!isHiding) {
-                    dismissAnimated()
-                }
-            }
-        }
-        pipCloseOrb = pCloseOrb
-
-        pipRow.addView(pAudioOrb)
-        pipRow.addView(pCloseOrb)
-        card.addView(pipRow)
-
-        // 3. Fullscreen Top-Right Liquid Glass Icon Orbs (`Audio` + `PiP Minimize` + `✕ Close`)
-        val fsRowMargin = expDp(18, expS)
-        val fsOrbSize = expDp(42, expS)
-        val fsOrbGap = expDp(12, expS)
-
-        val topRightRow = LinearLayout(context).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            clipChildren = false
-            clipToPadding = false
-            val pad = expDp(6, expS)
-            setPadding(pad, pad, pad, pad)
+            setFocusedSlot(1, animated = false)
             alpha = if (startFullscreen) 1f else 0f
+            translationY = if (startFullscreen) 0f else -fsDockSlidePx
             visibility = if (startFullscreen) View.VISIBLE else View.GONE
+            elevation = expDp(8, expS).toFloat()
             layoutParams = FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.WRAP_CONTENT,
                 FrameLayout.LayoutParams.WRAP_CONTENT,
                 Gravity.TOP or Gravity.END,
             ).apply {
-                setMargins(0, fsRowMargin, fsRowMargin, 0)
+                setMargins(0, fsMargin, fsMargin, 0)
             }
         }
-        fsTopRightRow = topRightRow
-
-        val fAudioOrb = LiquidGlassOrbButton(
-            context = context,
-            iconType = GlassIconType.AUDIO_TOGGLE,
-            strokeScalePx = expDp(1, expS).toFloat(),
-        ).apply {
-            layoutParams = LinearLayout.LayoutParams(fsOrbSize, fsOrbSize).apply {
-                rightMargin = fsOrbGap
-            }
-            setOnHoverListener { _, ev ->
-                if (isFullscreen && ev.actionMasked == MotionEvent.ACTION_HOVER_ENTER) {
-                    setFullscreenFocusTarget(FullscreenFocusTarget.AUDIO_BTN)
-                }
-                false
-            }
-            setOnClickListener {
-                if (isFullscreen && !isHiding) {
-                    performAudioToggle()
-                }
-            }
-        }
-        fsAudioOrb = fAudioOrb
-
-        val pipMinOrb = LiquidGlassOrbButton(
-            context = context,
-            iconType = GlassIconType.PIP_MINIMIZE,
-            strokeScalePx = expDp(1, expS).toFloat(),
-        ).apply {
-            layoutParams = LinearLayout.LayoutParams(fsOrbSize, fsOrbSize).apply {
-                rightMargin = fsOrbGap
-            }
-            setOnHoverListener { _, ev ->
-                if (isFullscreen && ev.actionMasked == MotionEvent.ACTION_HOVER_ENTER) {
-                    setFullscreenFocusTarget(FullscreenFocusTarget.PIP_BTN)
-                }
-                false
-            }
-            setOnClickListener {
-                if (isFullscreen && !isHiding) {
-                    setFullscreen(false)
-                }
-            }
-        }
-        fsPipOrb = pipMinOrb
-
-        val fsDismissOrb = LiquidGlassOrbButton(
-            context = context,
-            iconType = GlassIconType.CLOSE_X,
-            strokeScalePx = expDp(1, expS).toFloat(),
-        ).apply {
-            layoutParams = LinearLayout.LayoutParams(fsOrbSize, fsOrbSize)
-            setOnHoverListener { _, ev ->
-                if (isFullscreen && ev.actionMasked == MotionEvent.ACTION_HOVER_ENTER) {
-                    setFullscreenFocusTarget(FullscreenFocusTarget.DISMISS_BTN)
-                }
-                false
-            }
-            setOnClickListener {
-                if (!isHiding) {
-                    dismissAnimated()
-                }
-            }
-        }
-        fsCloseOrb = fsDismissOrb
-
-        topRightRow.addView(fAudioOrb)
-        topRightRow.addView(pipMinOrb)
-        topRightRow.addView(fsDismissOrb)
-        card.addView(topRightRow)
-
-        updateFullscreenHudStyles(animated = false)
+        fsDock = fDock
+        card.addView(fDock)
     }
 
     private fun updatePipHudStyles(animated: Boolean, visibilityChanged: Boolean) {
@@ -1077,22 +988,27 @@ class OverlayManager(private val context: Context) {
         val pip = computePipTransform(cfg)
         val pipS = pip.scaleX.coerceAtLeast(0.15f)
         val rim = glassRimView ?: return
-        val pipRow = pipTopRightRow ?: return
-        val audioOrb = pipAudioOrb ?: return
-        val closeOrb = pipCloseOrb ?: return
+        val dock = pipDock ?: return
 
         if (!isPipHovered || isFullscreen) {
             rim.animate().cancel()
-            pipRow.animate().cancel()
+            dock.animate().cancel()
+            dock.setFocusedSlot(-1, animated = animated)
             if (animated) {
                 rim.animate().alpha(0f).setDuration(160L).start()
-                pipRow.animate()
-                    .alpha(0f)
-                    .scaleX(0.7f)
-                    .scaleY(0.7f)
-                    .setDuration(170L)
-                    .setInterpolator(exitEase)
-                    .start()
+                if (dock.visibility == View.VISIBLE) {
+                    dock.animate()
+                        .alpha(0f)
+                        .translationY(-pipDockSlidePx)
+                        .setDuration(150L)
+                        .setInterpolator(exitEase)
+                        .withEndAction {
+                            if (!isPipHovered || isFullscreen) {
+                                dock.visibility = View.GONE
+                            }
+                        }
+                        .start()
+                }
                 if (!isFullscreen) {
                     card.animate()
                         .scaleX(pip.scaleX)
@@ -1105,22 +1021,22 @@ class OverlayManager(private val context: Context) {
                 }
             } else {
                 rim.alpha = 0f
-                pipRow.alpha = 0f
-                pipRow.scaleX = 0.7f
-                pipRow.scaleY = 0.7f
+                dock.alpha = 0f
+                dock.translationY = -pipDockSlidePx
+                dock.visibility = View.GONE
             }
-            startGlassOrbSyncBurst(220L)
             return
         }
 
         val onCard = pipFocusTarget == PipFocusTarget.CARD
-        val onAudio = pipFocusTarget == PipFocusTarget.AUDIO_BTN
-        val onDismiss = pipFocusTarget == PipFocusTarget.DISMISS_BTN
+        val focusedSlot = when (pipFocusTarget) {
+            PipFocusTarget.CARD -> -1
+            PipFocusTarget.AUDIO_BTN -> 0
+            PipFocusTarget.DISMISS_BTN -> 1
+        }
+        dock.setFocusedSlot(focusedSlot, animated = animated && !visibilityChanged)
 
-        audioOrb.setFocusedState(onAudio)
-        closeOrb.setFocusedState(onDismiss)
-
-        val cardHoverFactor = if (onCard) 1.036f else 1.0f
+        val cardHoverFactor = if (onCard) 1.032f else 1.0f
         val targetScaleX = pip.scaleX * cardHoverFactor
         val targetScaleY = pip.scaleY * cardHoverFactor
         val targetX = pip.x - (cfg.overlayWidthPx * (cardHoverFactor - 1f) * 0.5f)
@@ -1128,7 +1044,7 @@ class OverlayManager(private val context: Context) {
 
         rim.setStrokeState(pipDp(2, pipS).toFloat(), bright = onCard)
         rim.animate().cancel()
-        rim.animate().alpha(if (onCard) 1f else 0.55f).setDuration(180L).start()
+        rim.animate().alpha(if (onCard) 1f else 0.50f).setDuration(170L).start()
 
         card.animate().cancel()
         card.animate()
@@ -1136,123 +1052,424 @@ class OverlayManager(private val context: Context) {
             .scaleY(targetScaleY)
             .translationX(targetX)
             .translationY(targetY)
-            .setDuration(220L)
+            .setDuration(210L)
             .setInterpolator(popSpring)
             .start()
 
-        pipRow.animate().cancel()
-        pipRow.animate()
+        dock.animate().cancel()
+        if (dock.visibility != View.VISIBLE) {
+            dock.alpha = 0f
+            dock.translationY = -pipDockSlidePx
+            dock.visibility = View.VISIBLE
+        }
+        dock.animate()
             .alpha(1f)
-            .scaleX(1f)
-            .scaleY(1f)
-            .setDuration(if (visibilityChanged) 230L else 150L)
-            .setInterpolator(popSpring)
+            .translationY(0f)
+            .setDuration(if (visibilityChanged) 200L else 130L)
+            .setInterpolator(enterEase)
             .start()
-
-        val audioScale = if (onAudio) 1.15f else 0.98f
-        val closeScale = if (onDismiss) 1.15f else 0.98f
-        audioOrb.animate().scaleX(audioScale).scaleY(audioScale).setDuration(170L).setInterpolator(popSpring).start()
-        closeOrb.animate().scaleX(closeScale).scaleY(closeScale).setDuration(170L).setInterpolator(popSpring).start()
-        startGlassOrbSyncBurst(300L)
     }
 
     private fun updateFullscreenHudStyles(animated: Boolean) {
-        val audioOrb = fsAudioOrb ?: return
-        val pipOrb = fsPipOrb ?: return
-        val closeOrb = fsCloseOrb ?: return
-
-        val onAudio = fsFocusTarget == FullscreenFocusTarget.AUDIO_BTN
-        val onPip = fsFocusTarget == FullscreenFocusTarget.PIP_BTN
-        val onClose = fsFocusTarget == FullscreenFocusTarget.DISMISS_BTN
-
-        audioOrb.setFocusedState(onAudio)
-        pipOrb.setFocusedState(onPip)
-        closeOrb.setFocusedState(onClose)
-
-        val audioScale = if (onAudio) 1.14f else 0.97f
-        val pipScale = if (onPip) 1.14f else 0.97f
-        val closeScale = if (onClose) 1.14f else 0.97f
-
-        if (animated) {
-            audioOrb.animate().scaleX(audioScale).scaleY(audioScale).setDuration(180L).setInterpolator(popSpring).start()
-            pipOrb.animate().scaleX(pipScale).scaleY(pipScale).setDuration(180L).setInterpolator(popSpring).start()
-            closeOrb.animate().scaleX(closeScale).scaleY(closeScale).setDuration(180L).setInterpolator(popSpring).start()
-            startGlassOrbSyncBurst(260L)
-        } else {
-            audioOrb.scaleX = audioScale
-            audioOrb.scaleY = audioScale
-            pipOrb.scaleX = pipScale
-            pipOrb.scaleY = pipScale
-            closeOrb.scaleX = closeScale
-            closeOrb.scaleY = closeScale
-            syncGlassOrbUniforms()
+        val dock = fsDock ?: return
+        val slot = when (fsFocusTarget) {
+            FullscreenFocusTarget.AUDIO_BTN -> 0
+            FullscreenFocusTarget.PIP_BTN -> 1
+            FullscreenFocusTarget.DISMISS_BTN -> 2
         }
+        dock.setFocusedSlot(slot, animated = animated)
     }
 
-    private fun startGlassOrbSyncBurst(durationMs: Long) {
-        syncGlassOrbUniforms()
-        glassSyncUntilMs = maxOf(glassSyncUntilMs, SystemClock.uptimeMillis() + durationMs)
-        if (!glassSyncRunning) {
-            glassSyncRunning = true
-            Choreographer.getInstance().postFrameCallback(glassSyncFrameCallback)
+    /**
+     * Sleek Apple tvOS dark smoked-glass capsule control dock.
+     *
+     * Features:
+     *  - Deep translucent obsidian capsule with specular top sheen & crisp 1px glass hair-rim
+     *    (effortless high contrast over both pure white daytime sky and pitch-black night).
+     *  - Silky 60 fps sliding pure-white Apple tvOS focus pill with crisp dark-charcoal icon inversion.
+     *  - Luminous Apple Blue (#0A84FF) circular badge when doorbell Audio is active ON.
+     *  - 100% hardware-accelerated single-View rendering (zero layout jitter or software-layer clipping).
+     */
+    private inner class SmokedGlassControlDock(
+        context: Context,
+        private val icons: List<DockIconType>,
+        private val slotSizePx: Float,
+        private val slotGapPx: Float,
+        private val dockPadPx: Float,
+        private val strokeUnitPx: Float,
+        private val onSlotHovered: (Int) -> Unit,
+        private val onSlotClicked: (Int) -> Unit,
+    ) : View(context) {
+
+        private var focusedSlot: Int = -1
+        private var audioActive: Boolean = false
+
+        // Smooth 60 fps animated focus highlight position & alpha
+        private var focusSlidePos: Float = 0f
+        private var focusAlpha: Float = 0f
+        private var slideAnim: ValueAnimator? = null
+        private var alphaAnim: ValueAnimator? = null
+        private val slideEase = PathInterpolator(0.22f, 1f, 0.36f, 1f)
+
+        private val dockBgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
+        private val dockSheenPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
+        private val dockRimPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE
+            strokeWidth = strokeUnitPx * 1.15f
         }
-    }
-
-    private fun syncGlassOrbUniforms() {
-        val rend = renderer ?: return
-        val card = cardView ?: return
-        val cw = card.width.toFloat()
-        val ch = card.height.toFloat()
-        if (cw <= 1f || ch <= 1f) return
-
-        val row: LinearLayout?
-        val o0: LiquidGlassOrbButton?
-        val o1: LiquidGlassOrbButton?
-        val o2: LiquidGlassOrbButton?
-
-        if (isFullscreen) {
-            row = fsTopRightRow
-            o0 = fsAudioOrb
-            o1 = fsPipOrb
-            o2 = fsCloseOrb
-        } else {
-            row = pipTopRightRow
-            o0 = pipAudioOrb
-            o1 = pipCloseOrb
-            o2 = null
+        private val focusFillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.FILL
+            color = Color.parseColor("#FAFFFFFF")
+        }
+        private val activeBluePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.FILL
+            color = Color.parseColor("#FF0A84FF")
+        }
+        private val activeBlueFocusRingPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE
+            strokeWidth = strokeUnitPx * 2.1f
+            color = Color.WHITE
+        }
+        private val iconStrokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE
+            strokeCap = Paint.Cap.ROUND
+            strokeJoin = Paint.Join.ROUND
+        }
+        private val iconFillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.FILL
+        }
+        private val slashCutoutPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE
+            strokeCap = Paint.Cap.ROUND
         }
 
-        if (row == null || row.visibility != View.VISIBLE || row.alpha <= 0.01f) {
-            rend.glassOrbState.clearOrbs()
-            return
-        }
+        private val rect = RectF()
+        private val speakerPath = Path()
+        private val arrowPath = Path()
 
-        fun mapOrb(orb: LiquidGlassOrbButton?): FloatArray {
-            if (orb == null || orb.width <= 0 || orb.height <= 0) {
-                return floatArrayOf(0f, 0f, 0f, 0f, 0f, 0f)
+        init {
+            outlineProvider = object : ViewOutlineProvider() {
+                override fun getOutline(view: View, outline: Outline) {
+                    val r = view.height * 0.5f
+                    outline.setRoundRect(0, 0, view.width, view.height, r)
+                }
             }
-            val cxRow = orb.left + orb.width * 0.5f + orb.translationX
-            val cyRow = orb.top + orb.height * 0.5f + orb.translationY
-            val cxCard = row.left + row.pivotX + (cxRow - row.pivotX) * row.scaleX + row.translationX
-            val cyCard = row.top + row.pivotY + (cyRow - row.pivotY) * row.scaleY + row.translationY
-            val rCard = orb.visualRadiusPx() * orb.scaleX * row.scaleX
-            val vidCx = (cxCard / cw) * 1280f
-            val vidCy = (cyCard / ch) * 720f
-            val vidR = (rCard / cw) * 1280f
-            val alpha = (row.alpha * orb.alpha).coerceIn(0f, 1f)
-            val focused = if (orb.isFocusedState) 1f else 0f
-            val active = if (orb.isActiveToggleState) 1f else 0f
-            return floatArrayOf(vidCx, vidCy, vidR, alpha, focused, active)
+            clipToOutline = false
         }
 
-        val m0 = mapOrb(o0)
-        val m1 = mapOrb(o1)
-        val m2 = mapOrb(o2)
-        rend.glassOrbState.setOrbs(
-            m0[0], m0[1], m0[2], m0[3], m0[4], m0[5],
-            m1[0], m1[1], m1[2], m1[3], m1[4], m1[5],
-            m2[0], m2[1], m2[2], m2[3], m2[4], m2[5],
-        )
+        fun setAudioActive(active: Boolean) {
+            if (audioActive == active) return
+            audioActive = active
+            invalidate()
+        }
+
+        fun setFocusedSlot(slot: Int, animated: Boolean) {
+            val prev = focusedSlot
+            focusedSlot = slot
+            if (slot < 0) {
+                alphaAnim?.cancel()
+                if (animated && focusAlpha > 0f) {
+                    alphaAnim = ValueAnimator.ofFloat(focusAlpha, 0f).apply {
+                        duration = 140L
+                        interpolator = exitEase
+                        addUpdateListener {
+                            focusAlpha = it.animatedValue as Float
+                            invalidate()
+                        }
+                        start()
+                    }
+                } else {
+                    focusAlpha = 0f
+                    invalidate()
+                }
+                return
+            }
+
+            val targetX = slot.toFloat()
+            slideAnim?.cancel()
+            alphaAnim?.cancel()
+
+            if (!animated || prev < 0 || focusAlpha <= 0.05f) {
+                focusSlidePos = targetX
+                if (animated) {
+                    alphaAnim = ValueAnimator.ofFloat(focusAlpha, 1f).apply {
+                        duration = 150L
+                        interpolator = slideEase
+                        addUpdateListener {
+                            focusAlpha = it.animatedValue as Float
+                            invalidate()
+                        }
+                        start()
+                    }
+                } else {
+                    focusAlpha = 1f
+                    invalidate()
+                }
+            } else {
+                focusAlpha = 1f
+                slideAnim = ValueAnimator.ofFloat(focusSlidePos, targetX).apply {
+                    duration = 175L
+                    interpolator = slideEase
+                    addUpdateListener {
+                        focusSlidePos = it.animatedValue as Float
+                        invalidate()
+                    }
+                    start()
+                }
+            }
+        }
+
+        fun cancelAnimations() {
+            slideAnim?.cancel()
+            slideAnim = null
+            alphaAnim?.cancel()
+            alphaAnim = null
+        }
+
+        private fun slotCenterX(slotPos: Float): Float =
+            dockPadPx + slotSizePx * 0.5f + slotPos * (slotSizePx + slotGapPx)
+
+        private fun hitSlot(x: Float): Int {
+            for (i in icons.indices) {
+                val cx = slotCenterX(i.toFloat())
+                if (kotlin.math.abs(x - cx) <= (slotSizePx + slotGapPx) * 0.5f) {
+                    return i
+                }
+            }
+            return -1
+        }
+
+        override fun onHoverEvent(event: MotionEvent): Boolean {
+            if (event.actionMasked == MotionEvent.ACTION_HOVER_ENTER ||
+                event.actionMasked == MotionEvent.ACTION_HOVER_MOVE
+            ) {
+                val idx = hitSlot(event.x)
+                if (idx >= 0) onSlotHovered(idx)
+            }
+            return true
+        }
+
+        override fun onTouchEvent(event: MotionEvent): Boolean {
+            if (event.actionMasked == MotionEvent.ACTION_UP) {
+                val idx = hitSlot(event.x)
+                if (idx >= 0) onSlotClicked(idx)
+            }
+            return true
+        }
+
+        override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
+            val totalW = (dockPadPx * 2f + icons.size * slotSizePx + (icons.size - 1) * slotGapPx).toInt()
+            val totalH = (dockPadPx * 2f + slotSizePx).toInt()
+            setMeasuredDimension(totalW, totalH)
+        }
+
+        override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
+            super.onSizeChanged(w, h, oldw, oldh)
+            if (w <= 0 || h <= 0) return
+            val hf = h.toFloat()
+            // Rich Apple tvOS dark smoked obsidian glass fill (crisp contrast over white sky & dark night)
+            dockBgPaint.shader = LinearGradient(
+                0f, 0f, 0f, hf,
+                intArrayOf(
+                    Color.parseColor("#D41D232E"),
+                    Color.parseColor("#DE12161E"),
+                ),
+                null,
+                Shader.TileMode.CLAMP,
+            )
+            // Subtle glossy top glass highlight sheen
+            dockSheenPaint.shader = LinearGradient(
+                0f, 0f, 0f, hf * 0.48f,
+                intArrayOf(Color.parseColor("#24FFFFFF"), Color.TRANSPARENT),
+                null,
+                Shader.TileMode.CLAMP,
+            )
+            // Crisp hairline specular border
+            dockRimPaint.shader = LinearGradient(
+                0f, 0f, 0f, hf,
+                intArrayOf(
+                    Color.parseColor("#54FFFFFF"),
+                    Color.parseColor("#20FFFFFF"),
+                    Color.parseColor("#30FFFFFF"),
+                ),
+                floatArrayOf(0f, 0.55f, 1f),
+                Shader.TileMode.CLAMP,
+            )
+        }
+
+        override fun onDraw(canvas: Canvas) {
+            val wf = width.toFloat()
+            val hf = height.toFloat()
+            if (wf <= 0f || hf <= 0f) return
+
+            val radius = hf * 0.5f
+            val rimInset = dockRimPaint.strokeWidth * 0.55f
+
+            // 1. Dark smoked glass capsule body + subtle top sheen + hairline specular rim
+            rect.set(rimInset, rimInset, wf - rimInset, hf - rimInset)
+            canvas.drawRoundRect(rect, radius, radius, dockBgPaint)
+            canvas.drawRoundRect(rect, radius, radius, dockSheenPaint)
+            canvas.drawRoundRect(rect, radius, radius, dockRimPaint)
+
+            val cy = hf * 0.5f
+            val slotR = slotSizePx * 0.5f
+
+            // 2. Active Audio Apple Blue badge (when Audio is ON and NOT currently under the white focus pill,
+            //    or glows beneath the focus ring when focused!)
+            val audioSlotIdx = icons.indexOf(DockIconType.AUDIO_TOGGLE)
+            if (audioActive && audioSlotIdx >= 0) {
+                val ax = slotCenterX(audioSlotIdx.toFloat())
+                activeBluePaint.alpha = 240
+                canvas.drawCircle(ax, cy, slotR - strokeUnitPx * 0.5f, activeBluePaint)
+            }
+
+            // 3. Silky 60 fps sliding Apple tvOS focus pill
+            if (focusAlpha > 0.01f) {
+                val fx = slotCenterX(focusSlidePos)
+                val overActiveAudio = audioActive && audioSlotIdx >= 0 &&
+                    kotlin.math.abs(focusSlidePos - audioSlotIdx.toFloat()) < 0.35f
+                if (overActiveAudio) {
+                    // Luminous Apple Blue + crisp pure-white outer focus ring
+                    activeBluePaint.alpha = 255
+                    canvas.drawCircle(fx, cy, slotR - strokeUnitPx * 0.4f, activeBluePaint)
+                    activeBlueFocusRingPaint.alpha = (focusAlpha * 255f).toInt().coerceIn(0, 255)
+                    canvas.drawCircle(fx, cy, slotR - activeBlueFocusRingPaint.strokeWidth * 0.55f, activeBlueFocusRingPaint)
+                } else {
+                    // Classic Apple tvOS pure-white elevated focus circle
+                    focusFillPaint.alpha = (focusAlpha * 250f).toInt().coerceIn(0, 255)
+                    canvas.drawCircle(fx, cy, slotR - strokeUnitPx * 0.35f, focusFillPaint)
+                }
+            }
+
+            // 4. Crisp SF-Symbols-grade icons with smooth focus color inversion
+            for (i in icons.indices) {
+                val cx = slotCenterX(i.toFloat())
+                val distToFocus = kotlin.math.abs(focusSlidePos - i.toFloat())
+                val focusWeight = if (focusAlpha > 0.01f) {
+                    (1f - (distToFocus / 0.65f).coerceIn(0f, 1f)) * focusAlpha
+                } else 0f
+
+                val isActiveAudioSlot = icons[i] == DockIconType.AUDIO_TOGGLE && audioActive
+                val iconColor = if (isActiveAudioSlot) {
+                    Color.WHITE
+                } else {
+                    blendArgb(Color.parseColor("#F0FFFFFF"), Color.parseColor("#FF12161E"), focusWeight)
+                }
+                val cutoutColor = if (isActiveAudioSlot) {
+                    Color.parseColor("#FF0A84FF")
+                } else {
+                    blendArgb(Color.parseColor("#FF161B24"), Color.parseColor("#FAFFFFFF"), focusWeight)
+                }
+
+                drawDockIcon(canvas, icons[i], cx, cy, slotR, iconColor, cutoutColor)
+            }
+        }
+
+        private fun drawDockIcon(
+            canvas: Canvas,
+            type: DockIconType,
+            cx: Float,
+            cy: Float,
+            slotR: Float,
+            fgColor: Int,
+            bgColor: Int,
+        ) {
+            iconStrokePaint.color = fgColor
+            iconFillPaint.color = fgColor
+
+            when (type) {
+                DockIconType.CLOSE_X -> {
+                    iconStrokePaint.strokeWidth = strokeUnitPx * 1.95f
+                    val d = slotR * 0.30f
+                    canvas.drawLine(cx - d, cy - d, cx + d, cy + d, iconStrokePaint)
+                    canvas.drawLine(cx + d, cy - d, cx - d, cy + d, iconStrokePaint)
+                }
+                DockIconType.PIP_MINIMIZE -> {
+                    iconStrokePaint.strokeWidth = strokeUnitPx * 1.65f
+                    val ow = slotR * 0.94f
+                    val oh = slotR * 0.70f
+                    val cr = strokeUnitPx * 2.5f
+                    val left = cx - ow * 0.5f
+                    val top = cy - oh * 0.5f
+                    val right = cx + ow * 0.5f
+                    val bottom = cy + oh * 0.5f
+                    rect.set(left, top, right, bottom)
+                    canvas.drawRoundRect(rect, cr, cr, iconStrokePaint)
+
+                    // Top-right solid rounded PiP window
+                    val pw = ow * 0.42f
+                    val ph = oh * 0.42f
+                    val inset = strokeUnitPx * 2.0f
+                    val pLeft = right - inset - pw
+                    val pTop = top + inset
+                    rect.set(pLeft, pTop, right - inset, pTop + ph)
+                    canvas.drawRoundRect(rect, strokeUnitPx * 1.3f, strokeUnitPx * 1.3f, iconFillPaint)
+
+                    // Subtle diagonal arrow pointing into top-right PiP corner
+                    val ax0 = left + ow * 0.21f
+                    val ay0 = bottom - oh * 0.23f
+                    val ax1 = pLeft - strokeUnitPx * 1.5f
+                    val ay1 = pTop + ph + strokeUnitPx * 1.1f
+                    iconStrokePaint.strokeWidth = strokeUnitPx * 1.4f
+                    canvas.drawLine(ax0, ay0, ax1, ay1, iconStrokePaint)
+                    val head = strokeUnitPx * 2.7f
+                    arrowPath.reset()
+                    arrowPath.moveTo(ax1 - head, ay1)
+                    arrowPath.lineTo(ax1, ay1)
+                    arrowPath.lineTo(ax1, ay1 + head)
+                    canvas.drawPath(arrowPath, iconStrokePaint)
+                }
+                DockIconType.AUDIO_TOGGLE -> {
+                    val shiftX = if (audioActive) -slotR * 0.08f else 0f
+                    val spkLeft = cx + shiftX - slotR * 0.37f
+                    val spkMid = cx + shiftX - slotR * 0.19f
+                    val spkRight = cx + shiftX + slotR * 0.05f
+                    val boxHalfH = slotR * 0.15f
+                    val coneHalfH = slotR * 0.35f
+
+                    speakerPath.reset()
+                    speakerPath.moveTo(spkLeft + strokeUnitPx, cy - boxHalfH)
+                    speakerPath.lineTo(spkMid, cy - boxHalfH)
+                    speakerPath.lineTo(spkRight, cy - coneHalfH)
+                    speakerPath.lineTo(spkRight, cy + coneHalfH)
+                    speakerPath.lineTo(spkMid, cy + boxHalfH)
+                    speakerPath.lineTo(spkLeft + strokeUnitPx, cy + boxHalfH)
+                    speakerPath.quadTo(spkLeft, cy + boxHalfH, spkLeft, cy + boxHalfH - strokeUnitPx)
+                    speakerPath.lineTo(spkLeft, cy - boxHalfH + strokeUnitPx)
+                    speakerPath.quadTo(spkLeft, cy - boxHalfH, spkLeft + strokeUnitPx, cy - boxHalfH)
+                    speakerPath.close()
+                    canvas.drawPath(speakerPath, iconFillPaint)
+
+                    iconStrokePaint.strokeWidth = strokeUnitPx * 1.65f
+                    if (audioActive) {
+                        val r1 = slotR * 0.24f
+                        rect.set(spkRight - r1 * 0.25f, cy - r1, spkRight + r1 * 1.35f, cy + r1)
+                        canvas.drawArc(rect, -40f, 80f, false, iconStrokePaint)
+
+                        val r2 = slotR * 0.42f
+                        rect.set(spkRight - r2 * 0.25f, cy - r2, spkRight + r2 * 1.35f, cy + r2)
+                        canvas.drawArc(rect, -44f, 88f, false, iconStrokePaint)
+                    } else {
+                        // SF-Symbols split-slash: subtle knockout gap beside crisp diagonal mute slash
+                        val sd = slotR * 0.34f
+                        val gap = strokeUnitPx * 1.55f
+                        slashCutoutPaint.color = bgColor
+                        slashCutoutPaint.strokeWidth = strokeUnitPx * 2.1f
+                        canvas.drawLine(cx - sd + gap, cy - sd - gap, cx + sd + gap, cy + sd - gap, slashCutoutPaint)
+                        canvas.drawLine(cx - sd, cy - sd, cx + sd, cy + sd, iconStrokePaint)
+                    }
+                }
+            }
+        }
+
+        private fun blendArgb(c0: Int, c1: Int, t: Float): Int {
+            val k = t.coerceIn(0f, 1f)
+            val a = (Color.alpha(c0) + (Color.alpha(c1) - Color.alpha(c0)) * k).toInt()
+            val r = (Color.red(c0) + (Color.red(c1) - Color.red(c0)) * k).toInt()
+            val g = (Color.green(c0) + (Color.green(c1) - Color.green(c0)) * k).toInt()
+            val b = (Color.blue(c0) + (Color.blue(c1) - Color.blue(c0)) * k).toInt()
+            return Color.argb(a, r, g, b)
+        }
     }
 
     private inner class LiquidGlassRimView(context: Context) : View(context) {
@@ -1308,9 +1525,6 @@ class OverlayManager(private val context: Context) {
         }
     }
 
-    /**
-     * Subtle Apple Liquid Glass frost veil over the blurred connecting thumbnail.
-     */
     private inner class LiquidGlassFrostVeilView(context: Context) : View(context) {
         private val sheenPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
 
@@ -1335,9 +1549,6 @@ class OverlayManager(private val context: Context) {
         }
     }
 
-    /**
-     * Translucent Apple Liquid Glass pill LinearLayout (tightly wraps content, matching iOS 26 Button pill).
-     */
     private inner class LiquidGlassPillLayout(
         context: Context,
         private val strokeWidthPx: Float,
@@ -1403,9 +1614,6 @@ class OverlayManager(private val context: Context) {
         }
     }
 
-    /**
-     * Smooth 60 fps thin rounded-cap Apple-style arc spinner for the Liquid Glass connecting pill.
-     */
     private inner class AppleGlassSpinnerView(
         context: Context,
         private val strokePx: Float,
@@ -1432,275 +1640,6 @@ class OverlayManager(private val context: Context) {
             rect.set(pad, pad, wf - pad, hf - pad)
             canvas.drawOval(rect, trackPaint)
             canvas.drawArc(rect, sweepAngleDeg - 90f, 235f, false, arcPaint)
-        }
-    }
-
-    /**
-     * True Apple iOS 26 / visionOS see-through Liquid Glass circular orb button.
-     *
-     * The underlying live video is optically refracted + frosted directly in the OpenGL ES 2.0
-     * fragment shader (WatermarkInpaintDrawer.kt). This View renders only the razor-crisp
-     * specular glass rim, subtle meniscus highlight, and SF-Symbols-grade minimalist vector icon
-     * so you genuinely see the live refracted scene behind each button.
-     */
-    private inner class LiquidGlassOrbButton(
-        context: Context,
-        private val iconType: GlassIconType,
-        private val strokeScalePx: Float,
-    ) : View(context) {
-
-        var isFocusedState: Boolean = false
-            private set
-        var isActiveToggleState: Boolean = false
-            private set
-
-        private val glassTintPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
-        private val meniscusPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
-        private val innerRimPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE }
-        private val rimPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE }
-        private val iconPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            style = Paint.Style.STROKE
-            strokeCap = Paint.Cap.ROUND
-            strokeJoin = Paint.Join.ROUND
-            color = Color.WHITE
-        }
-        private val iconFillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            style = Paint.Style.FILL
-            color = Color.WHITE
-        }
-        private val rect = RectF()
-        private val speakerPath = Path()
-        private val arrowPath = Path()
-
-        init {
-            // Software layer only for crisp icon/rim drop-shadow readability over blazing white daylight sky
-            setLayerType(LAYER_TYPE_SOFTWARE, null)
-        }
-
-        fun visualRadiusPx(): Float {
-            val wf = width.toFloat()
-            val hf = height.toFloat()
-            return (minOf(wf, hf) * 0.5f - rimPaint.strokeWidth * 0.7f).coerceAtLeast(1f)
-        }
-
-        fun setFocusedState(focused: Boolean) {
-            if (isFocusedState == focused) return
-            isFocusedState = focused
-            rebuildShaders(width, height)
-            invalidate()
-        }
-
-        fun setActiveToggleState(active: Boolean) {
-            if (isActiveToggleState == active) return
-            isActiveToggleState = active
-            rebuildShaders(width, height)
-            invalidate()
-        }
-
-        override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
-            super.onSizeChanged(w, h, oldw, oldh)
-            rebuildShaders(w, h)
-        }
-
-        private fun rebuildShaders(w: Int, h: Int) {
-            if (w <= 0 || h <= 0) return
-            val wf = w.toFloat()
-            val hf = h.toFloat()
-
-            // 1. Ultra-light crystal surface wash (completely see-through so GPU refracted video shines through!)
-            val tintColors = when {
-                isActiveToggleState && isFocusedState -> intArrayOf(
-                    Color.parseColor("#385AC8FA"),
-                    Color.parseColor("#1A0A84FF"),
-                    Color.parseColor("#2E64D2FF"),
-                )
-                isActiveToggleState -> intArrayOf(
-                    Color.parseColor("#2838A8FF"),
-                    Color.parseColor("#120A84FF"),
-                    Color.parseColor("#205AC8FA"),
-                )
-                isFocusedState -> intArrayOf(
-                    Color.parseColor("#38FFFFFF"),
-                    Color.parseColor("#14FFFFFF"),
-                    Color.parseColor("#28FFFFFF"),
-                )
-                else -> intArrayOf(
-                    Color.parseColor("#20FFFFFF"),
-                    Color.parseColor("#0A0D141F"),
-                    Color.parseColor("#18FFFFFF"),
-                )
-            }
-            glassTintPaint.shader = LinearGradient(
-                0f, 0f, wf, hf,
-                tintColors,
-                floatArrayOf(0f, 0.52f, 1f),
-                Shader.TileMode.CLAMP,
-            )
-
-            // 2. Curved top-left glass meniscus sheen (authentic Apple Liquid Glass dome light)
-            val topAlpha = if (isFocusedState || isActiveToggleState) "#58FFFFFF" else "#38FFFFFF"
-            val midAlpha = if (isFocusedState || isActiveToggleState) "#18E6F7FF" else "#0CFFFFFF"
-            meniscusPaint.shader = RadialGradient(
-                wf * 0.30f,
-                hf * 0.22f,
-                wf * 0.62f,
-                intArrayOf(
-                    Color.parseColor(topAlpha),
-                    Color.parseColor(midAlpha),
-                    Color.TRANSPARENT,
-                ),
-                floatArrayOf(0f, 0.50f, 1f),
-                Shader.TileMode.CLAMP,
-            )
-
-            // 3. Soft inner luminous Fresnel ring just inside the crisp outer rim
-            innerRimPaint.strokeWidth = strokeScalePx * (if (isFocusedState) 2.6f else 1.8f)
-            innerRimPaint.shader = LinearGradient(
-                0f, 0f, wf, hf,
-                intArrayOf(
-                    Color.parseColor(if (isFocusedState) "#66FFFFFF" else "#38FFFFFF"),
-                    Color.parseColor("#10FFFFFF"),
-                    Color.parseColor("#0CFFFFFF"),
-                    Color.parseColor(if (isFocusedState) "#55FFFFFF" else "#2EFFFFFF"),
-                ),
-                floatArrayOf(0f, 0.38f, 0.68f, 1f),
-                Shader.TileMode.CLAMP,
-            )
-
-            // 4. Razor-crisp Apple double-catchlight diagonal specular rim (bright top-left & bottom-right)
-            rimPaint.strokeWidth = strokeScalePx * (if (isFocusedState) 2.15f else 1.45f)
-            val rimColors = if (isFocusedState || isActiveToggleState) {
-                intArrayOf(
-                    Color.parseColor("#FFFFFFFF"),
-                    Color.parseColor("#78D8F0FF"),
-                    Color.parseColor("#48FFFFFF"),
-                    Color.parseColor("#F0FFFFFF"),
-                )
-            } else {
-                intArrayOf(
-                    Color.parseColor("#E6FFFFFF"),
-                    Color.parseColor("#48FFFFFF"),
-                    Color.parseColor("#32FFFFFF"),
-                    Color.parseColor("#C2FFFFFF"),
-                )
-            }
-            rimPaint.shader = LinearGradient(
-                0f, 0f, wf, hf,
-                rimColors,
-                floatArrayOf(0f, 0.38f, 0.68f, 1f),
-                Shader.TileMode.CLAMP,
-            )
-
-            val iconColor = if (isFocusedState || isActiveToggleState) Color.WHITE else Color.parseColor("#F2FFFFFF")
-            iconPaint.color = iconColor
-            iconFillPaint.color = iconColor
-            // Subtle crisp drop-shadow keeps icons razor-sharp over both daylight sky and night shadows
-            val shadowRadius = strokeScalePx * 3.2f
-            val shadowDy = strokeScalePx * 0.9f
-            val shadowColor = Color.parseColor("#88000000")
-            iconPaint.setShadowLayer(shadowRadius, 0f, shadowDy, shadowColor)
-            iconFillPaint.setShadowLayer(shadowRadius, 0f, shadowDy, shadowColor)
-            rimPaint.setShadowLayer(strokeScalePx * 2.2f, 0f, strokeScalePx * 0.6f, Color.parseColor("#40000000"))
-        }
-
-        override fun onDraw(canvas: Canvas) {
-            val wf = width.toFloat()
-            val hf = height.toFloat()
-            if (wf <= 0f || hf <= 0f) return
-
-            val cx = wf * 0.5f
-            val cy = hf * 0.5f
-            val radius = visualRadiusPx()
-
-            canvas.drawCircle(cx, cy, radius, glassTintPaint)
-            canvas.drawCircle(cx, cy, radius, meniscusPaint)
-            canvas.drawCircle(cx, cy, (radius - innerRimPaint.strokeWidth * 0.55f).coerceAtLeast(1f), innerRimPaint)
-            canvas.drawCircle(cx, cy, radius, rimPaint)
-
-            when (iconType) {
-                GlassIconType.CLOSE_X -> {
-                    // Refined slender SF-Symbol `xmark`
-                    iconPaint.strokeWidth = strokeScalePx * 1.85f
-                    val d = radius * 0.30f
-                    canvas.drawLine(cx - d, cy - d, cx + d, cy + d, iconPaint)
-                    canvas.drawLine(cx + d, cy - d, cx - d, cy + d, iconPaint)
-                }
-                GlassIconType.PIP_MINIMIZE -> {
-                    // Refined SF-Symbol `pip.enter`: outer screen + sleek corner PiP + subtle inward arrow
-                    iconPaint.strokeWidth = strokeScalePx * 1.55f
-                    val ow = radius * 0.92f
-                    val oh = radius * 0.68f
-                    val cr = strokeScalePx * 2.6f
-                    val left = cx - ow * 0.5f
-                    val top = cy - oh * 0.5f
-                    val right = cx + ow * 0.5f
-                    val bottom = cy + oh * 0.5f
-                    rect.set(left, top, right, bottom)
-                    canvas.drawRoundRect(rect, cr, cr, iconPaint)
-
-                    // Solid rounded PiP inset in top-right corner (matching user's TOP_RIGHT PiP position!)
-                    val pw = ow * 0.42f
-                    val ph = oh * 0.42f
-                    val inset = strokeScalePx * 2.1f
-                    val pLeft = right - inset - pw
-                    val pTop = top + inset
-                    rect.set(pLeft, pTop, right - inset, pTop + ph)
-                    canvas.drawRoundRect(rect, strokeScalePx * 1.4f, strokeScalePx * 1.4f, iconFillPaint)
-
-                    // Crisp delicate diagonal arrow from bottom-left pointing toward the PiP corner
-                    val ax0 = left + ow * 0.22f
-                    val ay0 = bottom - oh * 0.24f
-                    val ax1 = pLeft - strokeScalePx * 1.6f
-                    val ay1 = pTop + ph + strokeScalePx * 1.2f
-                    iconPaint.strokeWidth = strokeScalePx * 1.35f
-                    canvas.drawLine(ax0, ay0, ax1, ay1, iconPaint)
-                    val head = strokeScalePx * 2.8f
-                    arrowPath.reset()
-                    arrowPath.moveTo(ax1 - head, ay1)
-                    arrowPath.lineTo(ax1, ay1)
-                    arrowPath.lineTo(ax1, ay1 + head)
-                    canvas.drawPath(arrowPath, iconPaint)
-                }
-                GlassIconType.AUDIO_TOGGLE -> {
-                    // Refined SF-Symbol `speaker.wave.2.fill` / `speaker.slash.fill`
-                    val shiftX = if (isActiveToggleState) -radius * 0.08f else 0f
-                    val spkLeft = cx + shiftX - radius * 0.36f
-                    val spkMid = cx + shiftX - radius * 0.18f
-                    val spkRight = cx + shiftX + radius * 0.05f
-                    val boxHalfH = radius * 0.15f
-                    val coneHalfH = radius * 0.34f
-
-                    // Rounded speaker silhouette
-                    speakerPath.reset()
-                    speakerPath.moveTo(spkLeft + strokeScalePx, cy - boxHalfH)
-                    speakerPath.lineTo(spkMid, cy - boxHalfH)
-                    speakerPath.lineTo(spkRight, cy - coneHalfH)
-                    speakerPath.lineTo(spkRight, cy + coneHalfH)
-                    speakerPath.lineTo(spkMid, cy + boxHalfH)
-                    speakerPath.lineTo(spkLeft + strokeScalePx, cy + boxHalfH)
-                    speakerPath.quadTo(spkLeft, cy + boxHalfH, spkLeft, cy + boxHalfH - strokeScalePx)
-                    speakerPath.lineTo(spkLeft, cy - boxHalfH + strokeScalePx)
-                    speakerPath.quadTo(spkLeft, cy - boxHalfH, spkLeft + strokeScalePx, cy - boxHalfH)
-                    speakerPath.close()
-                    canvas.drawPath(speakerPath, iconFillPaint)
-
-                    iconPaint.strokeWidth = strokeScalePx * 1.65f
-                    if (isActiveToggleState) {
-                        // Two graceful concentric Apple soundwave arcs
-                        val r1 = radius * 0.23f
-                        rect.set(spkRight - r1 * 0.25f, cy - r1, spkRight + r1 * 1.35f, cy + r1)
-                        canvas.drawArc(rect, -40f, 80f, false, iconPaint)
-
-                        val r2 = radius * 0.41f
-                        rect.set(spkRight - r2 * 0.25f, cy - r2, spkRight + r2 * 1.35f, cy + r2)
-                        canvas.drawArc(rect, -44f, 88f, false, iconPaint)
-                    } else {
-                        // Iconic clean SF-Symbol diagonal mute slash across speaker
-                        val sd = radius * 0.35f
-                        canvas.drawLine(cx - sd, cy - sd, cx + sd, cy + sd, iconPaint)
-                    }
-                }
-            }
         }
     }
 
