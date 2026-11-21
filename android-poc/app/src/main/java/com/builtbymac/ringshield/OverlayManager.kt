@@ -84,6 +84,7 @@ class OverlayManager(private val context: Context) {
     private val popSpring = OvershootInterpolator(1.25f)
 
     private var hostWindow: FrameLayout? = null
+    private var scrimView: View? = null
     private var cardView: FrameLayout? = null
     private var rootParams: WindowManager.LayoutParams? = null
     private var renderer: TextureViewRenderer? = null
@@ -95,6 +96,7 @@ class OverlayManager(private val context: Context) {
     private var hostOffsetX: Float = 0f
     private var hostOffsetY: Float = 0f
     private var currentCornerRadiusPx: Float = 0f
+    private var currentVisualCornerRadiusPx: Float = PIP_VISUAL_CORNER_RADIUS_PX
 
     private var connectingBackdrop: FrameLayout? = null
     private var connectingPreviewImage: ImageView? = null
@@ -104,7 +106,8 @@ class OverlayManager(private val context: Context) {
 
     private var glassRimView: LiquidGlassRimView? = null
 
-    // Sleek dark smoked-glass Apple tvOS control docks (PiP: 2 slots, Fullscreen: 3 slots)
+    // Sleek dark smoked-glass Apple tvOS control docks (PiP: 2 slots, Fullscreen: 3 slots),
+    // hosted directly in hostWindow at native 1080p 1:1 resolution (never stretched by card scale).
     private var pipDock: SmokedGlassControlDock? = null
     private var fsDock: SmokedGlassControlDock? = null
     private var pipDockSlidePx: Float = 0f
@@ -112,6 +115,7 @@ class OverlayManager(private val context: Context) {
 
     private var dotAnimator: ObjectAnimator? = null
     private var cornerAnimator: ValueAnimator? = null
+    private var morphAnimator: ValueAnimator? = null
     private var dismissRunnable: Runnable? = null
     private var onDismissCallback: (() -> Unit)? = null
     private var onKeepAliveCallback: (() -> Unit)? = null
@@ -183,6 +187,7 @@ class OverlayManager(private val context: Context) {
 
         val pip = computePipTransform(cfg)
         val exp = computeExpandedTransform()
+        currentVisualCornerRadiusPx = if (startFullscreen) EXPANDED_VISUAL_CORNER_RADIUS_PX else PIP_VISUAL_CORNER_RADIUS_PX
         currentCornerRadiusPx = if (startFullscreen) exp.unscaledCornerRadius else pip.unscaledCornerRadius
 
         val host = object : FrameLayout(context) {
@@ -280,10 +285,24 @@ class OverlayManager(private val context: Context) {
             card.addView(buildSubtleLiveDot(pip.scaleX))
         }
 
-        // 4. Apple tvOS dark smoked-glass HUD docks & specular card rim
-        buildControlHud(card, pip, exp, startFullscreen)
+        // 0. Subtle Apple tvOS cinematic ambient scrim behind Fullscreen card (transparent in PiP)
+        val scrim = View(context).apply {
+            setBackgroundColor(Color.parseColor("#94000000"))
+            alpha = 0f
+        }
+        scrimView = scrim
+        host.addView(
+            scrim,
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT,
+            )
+        )
 
         host.addView(card, FrameLayout.LayoutParams(cardBaseW, cardBaseH, Gravity.TOP or Gravity.START))
+
+        // 4. Apple tvOS specular card rim (on card) + native 1080p 1:1 dark smoked-glass docks (in host)
+        buildControlHud(host, card, cfg, pip, exp, startFullscreen)
 
         // Always keep the host window full-screen so WindowManager/SurfaceFlinger never
         // reallocates the overlay Surface mid-animation during PiP <-> Fullscreen transitions
@@ -515,6 +534,9 @@ class OverlayManager(private val context: Context) {
 
             card.animate().cancel()
             cornerAnimator?.cancel()
+            morphAnimator?.cancel()
+            glassRimView?.animate()?.cancel()
+            scrimView?.animate()?.cancel()
             host.requestFocus()
 
             val pip = computePipTransform(cfg)
@@ -522,8 +544,16 @@ class OverlayManager(private val context: Context) {
             card.pivotX = 0f
             card.pivotY = 0f
 
+            val fromScaleX = card.scaleX
+            val fromScaleY = card.scaleY
+            val fromX = card.translationX
+            val fromY = card.translationY
+            val fromVisR = currentVisualCornerRadiusPx
+            val fromScrim = scrimView?.alpha ?: 0f
+            val fromRim = glassRimView?.alpha ?: 0f
+
             if (expand) {
-                // 1. Cleanly dismiss PiP dock immediately before card grows (prevents scale distortion)
+                // 1. Dissolve native PiP dock immediately with subtle micro-shrink
                 isPipHovered = false
                 pipFocusTarget = PipFocusTarget.CARD
                 pipDock?.let { dock ->
@@ -532,72 +562,93 @@ class OverlayManager(private val context: Context) {
                     if (dock.visibility == View.VISIBLE) {
                         dock.animate()
                             .alpha(0f)
-                            .setDuration(70L)
+                            .scaleX(0.92f)
+                            .scaleY(0.92f)
+                            .setDuration(90L)
                             .setInterpolator(exitEase)
                             .withEndAction {
                                 if (isFullscreen) {
                                     dock.visibility = View.GONE
+                                    dock.translationX = 0f
                                     dock.translationY = -pipDockSlidePx
+                                    dock.scaleX = 1f
+                                    dock.scaleY = 1f
                                 }
                             }
                             .start()
                     }
                 }
 
-                // 2. Stage Fullscreen dock to glide in gracefully with Close (`✕`, slot 2) focused by default
+                // 2. Stage native-1080p Fullscreen dock to bloom gracefully right as the card lands
                 fsFocusTarget = FullscreenFocusTarget.DISMISS_BTN
                 fsDock?.let { dock ->
                     dock.animate().cancel()
                     dock.setAudioActive(isAudioActive)
                     dock.setFocusedSlot(2, animated = false)
                     dock.alpha = 0f
+                    dock.scaleX = 0.93f
+                    dock.scaleY = 0.93f
                     dock.translationY = -fsDockSlidePx
                     dock.visibility = View.VISIBLE
                     dock.animate()
                         .alpha(1f)
+                        .scaleX(1f)
+                        .scaleY(1f)
                         .translationY(0f)
-                        .setStartDelay(180L)
-                        .setDuration(220L)
+                        .setStartDelay(210L)
+                        .setDuration(240L)
                         .setInterpolator(enterEase)
                         .start()
                 }
 
-                glassRimView?.apply {
-                    setStrokeState(expDp(1, exp.scaleX).toFloat(), bright = false)
-                    animate().cancel()
-                    animate().alpha(0.70f).setDuration(260L).start()
-                }
-
+                glassRimView?.setStrokeState(expDp(1, exp.scaleX).toFloat(), bright = false)
                 card.elevation = 0f
-                animateCornerRadius(card, currentCornerRadiusPx, exp.unscaledCornerRadius, 380L)
 
-                card.animate()
-                    .scaleX(exp.scaleX)
-                    .scaleY(exp.scaleY)
-                    .translationX(exp.x - hostOffsetX)
-                    .translationY(exp.y - hostOffsetY)
-                    .setDuration(380L)
-                    .setInterpolator(morphEase)
-                    .start()
+                // 3. Single unified Apple tvOS spring driving scale, position, exact hyperbolic
+                //    visual corner radius, ambient theater scrim, and rim in exact lockstep.
+                runUnifiedSpringMorph(
+                    card = card,
+                    fromScaleX = fromScaleX,
+                    toScaleX = exp.scaleX,
+                    fromScaleY = fromScaleY,
+                    toScaleY = exp.scaleY,
+                    fromX = fromX,
+                    toX = exp.x,
+                    fromY = fromY,
+                    toY = exp.y,
+                    fromVisR = fromVisR,
+                    toVisR = EXPANDED_VISUAL_CORNER_RADIUS_PX,
+                    fromScrim = fromScrim,
+                    toScrim = 1f,
+                    fromRim = fromRim,
+                    toRim = 0.72f,
+                    durationMs = 480L,
+                    dampingRatio = 0.87f,
+                    omega0 = 13.5f,
+                )
             } else {
-                // 1. Fade Fullscreen dock out crisply BEFORE the card shrinks (no shrinking-ant glitch!)
+                // 1. Dissolve Fullscreen dock crisply before the card tucks away
                 fsDock?.let { dock ->
                     dock.animate().cancel()
                     dock.animate()
                         .alpha(0f)
+                        .scaleX(0.93f)
+                        .scaleY(0.93f)
                         .setStartDelay(0L)
-                        .setDuration(75L)
+                        .setDuration(85L)
                         .setInterpolator(exitEase)
                         .withEndAction {
                             if (!isFullscreen) {
                                 dock.visibility = View.GONE
                                 dock.translationY = -fsDockSlidePx
+                                dock.scaleX = 1f
+                                dock.scaleY = 1f
                             }
                         }
                         .start()
                 }
 
-                // 2. Reset PiP dock cleanly to ready hidden state (next D-pad tap reveals it cleanly)
+                // 2. Reset PiP dock cleanly to ready hidden state
                 isPipHovered = false
                 pipFocusTarget = PipFocusTarget.CARD
                 pipDock?.let { dock ->
@@ -605,26 +656,36 @@ class OverlayManager(private val context: Context) {
                     dock.setAudioActive(isAudioActive)
                     dock.setFocusedSlot(-1, animated = false)
                     dock.alpha = 0f
+                    dock.scaleX = 1f
+                    dock.scaleY = 1f
+                    dock.translationX = 0f
                     dock.translationY = -pipDockSlidePx
                     dock.visibility = View.GONE
                 }
 
-                glassRimView?.apply {
-                    animate().cancel()
-                    animate().alpha(0f).setDuration(150L).start()
-                }
-
                 card.elevation = 0f
-                animateCornerRadius(card, currentCornerRadiusPx, pip.unscaledCornerRadius, 350L)
 
-                card.animate()
-                    .scaleX(pip.scaleX)
-                    .scaleY(pip.scaleY)
-                    .translationX(pip.x - hostOffsetX)
-                    .translationY(pip.y - hostOffsetY)
-                    .setDuration(350L)
-                    .setInterpolator(morphEase)
-                    .start()
+                // 3. Crisp critically-damped Apple tvOS tuck back into the corner
+                runUnifiedSpringMorph(
+                    card = card,
+                    fromScaleX = fromScaleX,
+                    toScaleX = pip.scaleX,
+                    fromScaleY = fromScaleY,
+                    toScaleY = pip.scaleY,
+                    fromX = fromX,
+                    toX = pip.x,
+                    fromY = fromY,
+                    toY = pip.y,
+                    fromVisR = fromVisR,
+                    toVisR = PIP_VISUAL_CORNER_RADIUS_PX,
+                    fromScrim = fromScrim,
+                    toScrim = 0f,
+                    fromRim = fromRim,
+                    toRim = 0f,
+                    durationMs = 420L,
+                    dampingRatio = 0.96f,
+                    omega0 = 15.0f,
+                )
             }
         }
     }
@@ -646,9 +707,22 @@ class OverlayManager(private val context: Context) {
             card.animate().cancel()
             video?.animate()?.cancel()
             cornerAnimator?.cancel()
+            morphAnimator?.cancel()
+            scrimView?.animate()?.cancel()
             pipDock?.animate()?.cancel()
             fsDock?.animate()?.cancel()
 
+            scrimView?.animate()?.alpha(0f)?.setDuration(240L)?.setInterpolator(exitEase)?.start()
+            pipDock?.let { dock ->
+                if (dock.visibility == View.VISIBLE) {
+                    dock.animate().alpha(0f).scaleX(0.92f).scaleY(0.92f).setDuration(120L).setInterpolator(exitEase).start()
+                }
+            }
+            fsDock?.let { dock ->
+                if (dock.visibility == View.VISIBLE) {
+                    dock.animate().alpha(0f).scaleX(0.93f).scaleY(0.93f).setDuration(120L).setInterpolator(exitEase).start()
+                }
+            }
             video?.animate()?.alpha(0f)?.setDuration(240L)?.setInterpolator(exitEase)?.start()
 
             if (isFullscreen) {
@@ -699,6 +773,8 @@ class OverlayManager(private val context: Context) {
         dismissRunnable = null
         cornerAnimator?.cancel()
         cornerAnimator = null
+        morphAnimator?.cancel()
+        morphAnimator = null
         dotAnimator?.cancel()
         dotAnimator = null
         connectingPulseAnimator?.cancel()
@@ -718,6 +794,7 @@ class OverlayManager(private val context: Context) {
 
         val h = hostWindow
         hostWindow = null
+        scrimView = null
         cardView = null
         rootParams = null
         currentCfg = null
@@ -757,7 +834,7 @@ class OverlayManager(private val context: Context) {
             val exp = computeExpandedTransform()
             val startScale = exp.scaleX * 0.94f
             val startX = (screenW - cardBaseW * startScale) / 2f - hostOffsetX
-            val startY = (screenH - cardBaseH * startScale) / 2f + dp(16) - hostOffsetY
+            val startY = (screenH - cardBaseH * startScale) / 2f + dp(14) - hostOffsetY
             card.elevation = 0f
 
             card.pivotX = 0f
@@ -767,13 +844,34 @@ class OverlayManager(private val context: Context) {
             card.scaleX = startScale
             card.scaleY = startScale
             card.alpha = 0f
+
+            scrimView?.apply {
+                alpha = 0f
+                animate().alpha(1f).setDuration(320L).setInterpolator(enterEase).start()
+            }
+            fsDock?.apply {
+                alpha = 0f
+                scaleX = 0.94f
+                scaleY = 0.94f
+                translationY = -fsDockSlidePx
+                visibility = View.VISIBLE
+                animate()
+                    .alpha(1f)
+                    .scaleX(1f)
+                    .scaleY(1f)
+                    .translationY(0f)
+                    .setStartDelay(120L)
+                    .setDuration(240L)
+                    .setInterpolator(enterEase)
+                    .start()
+            }
             card.animate()
                 .alpha(1f)
                 .translationX(exp.x - hostOffsetX)
                 .translationY(exp.y - hostOffsetY)
                 .scaleX(exp.scaleX)
                 .scaleY(exp.scaleY)
-                .setDuration(320L)
+                .setDuration(360L)
                 .setInterpolator(enterEase)
                 .start()
             return
@@ -929,7 +1027,9 @@ class OverlayManager(private val context: Context) {
     }
 
     private fun buildControlHud(
+        host: FrameLayout,
         card: FrameLayout,
+        cfg: PocConfig,
         pip: PipTransform,
         exp: PipTransform,
         startFullscreen: Boolean,
@@ -937,13 +1037,13 @@ class OverlayManager(private val context: Context) {
         val pipS = pip.scaleX.coerceAtLeast(0.15f)
         val expS = exp.scaleX.coerceAtLeast(0.5f)
 
-        // 1. Subtle specular rim around the card
+        // 1. Subtle specular rim around the card (lives on card so it tracks outline 1:1)
         val rim = LiquidGlassRimView(context).apply {
             setStrokeState(
                 strokeWidthPx = if (startFullscreen) expDp(1, expS).toFloat() else pipDp(2, pipS).toFloat(),
                 bright = false,
             )
-            alpha = if (startFullscreen) 0.70f else 0f
+            alpha = if (startFullscreen) 0.72f else 0f
             layoutParams = FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT,
                 FrameLayout.LayoutParams.MATCH_PARENT,
@@ -953,15 +1053,18 @@ class OverlayManager(private val context: Context) {
         card.addView(rim)
 
         // 2. Corner PiP Top-Right Dark Smoked Glass Capsule Dock (`[ Audio | ✕ ]`)
-        val pipMargin = pipDp(12, pipS)
-        pipDockSlidePx = pipDp(6, pipS).toFloat()
+        //    Hosted directly in hostWindow at native 1080p 1:1 resolution (razor-sharp, zero card-scale stretch).
+        val pipInset = dp(12)
+        val pipRightMargin = (screenW - (pip.x + cfg.overlayWidthPx)).toInt().coerceAtLeast(0) + pipInset
+        val pipTopMargin = pip.y.toInt().coerceAtLeast(0) + pipInset
+        pipDockSlidePx = dp(6).toFloat()
         val pDock = SmokedGlassControlDock(
             context = context,
             icons = listOf(DockIconType.AUDIO_TOGGLE, DockIconType.CLOSE_X),
-            slotSizePx = pipDp(34, pipS).toFloat(),
-            slotGapPx = pipDp(4, pipS).toFloat(),
-            dockPadPx = pipDp(4, pipS).toFloat(),
-            strokeUnitPx = pipDp(1, pipS).toFloat(),
+            slotSizePx = dp(34).toFloat(),
+            slotGapPx = dp(4).toFloat(),
+            dockPadPx = dp(4).toFloat(),
+            strokeUnitPx = dp(1).toFloat(),
             onSlotHovered = { idx ->
                 if (!isFullscreen && !isHiding) {
                     val target = if (idx == 0) PipFocusTarget.AUDIO_BTN else PipFocusTarget.DISMISS_BTN
@@ -983,22 +1086,26 @@ class OverlayManager(private val context: Context) {
                 FrameLayout.LayoutParams.WRAP_CONTENT,
                 Gravity.TOP or Gravity.END,
             ).apply {
-                setMargins(0, pipMargin, pipMargin, 0)
+                setMargins(0, pipTopMargin, pipRightMargin, 0)
             }
         }
         pipDock = pDock
-        card.addView(pDock)
+        host.addView(pDock)
 
         // 3. Fullscreen Top-Right Dark Smoked Glass Capsule Dock (`[ Audio | PiP | ✕ ]`)
-        val fsMargin = expDp(20, expS)
-        fsDockSlidePx = expDp(8, expS).toFloat()
+        //    Hosted directly in hostWindow at native 1080p 1:1 resolution.
+        val fsTargetW = screenW * EXPANDED_SCREEN_FRACTION
+        val fsInset = dp(20)
+        val fsRightMargin = (screenW - (exp.x + fsTargetW)).toInt().coerceAtLeast(0) + fsInset
+        val fsTopMargin = exp.y.toInt().coerceAtLeast(0) + fsInset
+        fsDockSlidePx = dp(7).toFloat()
         val fDock = SmokedGlassControlDock(
             context = context,
             icons = listOf(DockIconType.AUDIO_TOGGLE, DockIconType.PIP_MINIMIZE, DockIconType.CLOSE_X),
-            slotSizePx = expDp(42, expS).toFloat(),
-            slotGapPx = expDp(5, expS).toFloat(),
-            dockPadPx = expDp(5, expS).toFloat(),
-            strokeUnitPx = expDp(1, expS).toFloat(),
+            slotSizePx = dp(42).toFloat(),
+            slotGapPx = dp(5).toFloat(),
+            dockPadPx = dp(5).toFloat(),
+            strokeUnitPx = dp(1).toFloat(),
             onSlotHovered = { idx ->
                 if (isFullscreen && !isHiding) {
                     val target = when (idx) {
@@ -1020,8 +1127,8 @@ class OverlayManager(private val context: Context) {
             },
         ).apply {
             setFocusedSlot(2, animated = false)
-            alpha = if (startFullscreen) 1f else 0f
-            translationY = if (startFullscreen) 0f else -fsDockSlidePx
+            alpha = 0f
+            translationY = -fsDockSlidePx
             visibility = if (startFullscreen) View.VISIBLE else View.GONE
             elevation = 0f
             layoutParams = FrameLayout.LayoutParams(
@@ -1029,11 +1136,11 @@ class OverlayManager(private val context: Context) {
                 FrameLayout.LayoutParams.WRAP_CONTENT,
                 Gravity.TOP or Gravity.END,
             ).apply {
-                setMargins(0, fsMargin, fsMargin, 0)
+                setMargins(0, fsTopMargin, fsRightMargin, 0)
             }
         }
         fsDock = fDock
-        card.addView(fDock)
+        host.addView(fDock)
     }
 
     private fun updatePipHudStyles(animated: Boolean, visibilityChanged: Boolean) {
@@ -1053,12 +1160,18 @@ class OverlayManager(private val context: Context) {
                 if (dock.visibility == View.VISIBLE) {
                     dock.animate()
                         .alpha(0f)
+                        .scaleX(0.93f)
+                        .scaleY(0.93f)
+                        .translationX(0f)
                         .translationY(-pipDockSlidePx)
-                        .setDuration(150L)
+                        .setDuration(140L)
                         .setInterpolator(exitEase)
                         .withEndAction {
                             if (!isPipHovered || isFullscreen) {
                                 dock.visibility = View.GONE
+                                dock.scaleX = 1f
+                                dock.scaleY = 1f
+                                dock.translationX = 0f
                             }
                         }
                         .start()
@@ -1094,9 +1207,12 @@ class OverlayManager(private val context: Context) {
         val cardHoverFactor = if (onCard) 1.032f else 1.0f
         val targetScaleX = pip.scaleX * cardHoverFactor
         val targetScaleY = pip.scaleY * cardHoverFactor
-        val targetX = pip.x - (cfg.overlayWidthPx * (cardHoverFactor - 1f) * 0.5f) - hostOffsetX
-        val targetY = pip.y - (cfg.overlayHeightPx * (cardHoverFactor - 1f) * 0.5f) - hostOffsetY
+        val hoverShiftX = cfg.overlayWidthPx * (cardHoverFactor - 1f) * 0.5f
+        val hoverShiftY = cfg.overlayHeightPx * (cardHoverFactor - 1f) * 0.5f
+        val targetX = pip.x - hoverShiftX - hostOffsetX
+        val targetY = pip.y - hoverShiftY - hostOffsetY
 
+        morphAnimator?.cancel()
         rim.setStrokeState(pipDp(2, pipS).toFloat(), bright = onCard)
         rim.animate().cancel()
         rim.animate().alpha(if (onCard) 1f else 0.50f).setDuration(170L).start()
@@ -1115,13 +1231,19 @@ class OverlayManager(private val context: Context) {
         dock.animate().cancel()
         if (dock.visibility != View.VISIBLE) {
             dock.alpha = 0f
-            dock.translationY = -pipDockSlidePx
+            dock.scaleX = 0.93f
+            dock.scaleY = 0.93f
+            dock.translationX = hoverShiftX
+            dock.translationY = -hoverShiftY - pipDockSlidePx
             dock.visibility = View.VISIBLE
         }
         dock.animate()
             .alpha(1f)
-            .translationY(0f)
-            .setDuration(if (visibilityChanged) 200L else 130L)
+            .scaleX(1f)
+            .scaleY(1f)
+            .translationX(hoverShiftX)
+            .translationY(-hoverShiftY)
+            .setDuration(if (visibilityChanged) 200L else 150L)
             .setInterpolator(enterEase)
             .start()
     }
@@ -1833,6 +1955,80 @@ class OverlayManager(private val context: Context) {
             rect.set(pad, pad, wf - pad, hf - pad)
             canvas.drawOval(rect, trackPaint)
             canvas.drawArc(rect, sweepAngleDeg - 90f, 235f, false, arcPaint)
+        }
+    }
+
+    /**
+     * Unified Apple tvOS damped-spring transition driving scale, translation, exact hyperbolic
+     * corner radius (constant visual radius without scale-bulge), theater scrim, and specular rim
+     * in a single VSync callback with zero phase drift.
+     */
+    private fun runUnifiedSpringMorph(
+        card: FrameLayout,
+        fromScaleX: Float,
+        toScaleX: Float,
+        fromScaleY: Float,
+        toScaleY: Float,
+        fromX: Float,
+        toX: Float,
+        fromY: Float,
+        toY: Float,
+        fromVisR: Float,
+        toVisR: Float,
+        fromScrim: Float,
+        toScrim: Float,
+        fromRim: Float,
+        toRim: Float,
+        durationMs: Long,
+        dampingRatio: Float,
+        omega0: Float,
+    ) {
+        morphAnimator?.cancel()
+        val durationSec = durationMs / 1000.0
+        val endVal = evalSpringRaw(1.0, dampingRatio.toDouble(), omega0.toDouble(), durationSec)
+        val norm = if (kotlin.math.abs(endVal) > 1e-4) 1.0 / endVal else 1.0
+
+        morphAnimator = ValueAnimator.ofFloat(0f, 1f).apply {
+            duration = durationMs
+            interpolator = LinearInterpolator()
+            addUpdateListener { anim ->
+                val u = (anim.animatedValue as Float).toDouble()
+                val p = if (u >= 0.9999) 1f else (evalSpringRaw(u, dampingRatio.toDouble(), omega0.toDouble(), durationSec) * norm).toFloat()
+                val pc = p.coerceIn(0f, 1f)
+
+                val sx = (fromScaleX + (toScaleX - fromScaleX) * p).coerceAtLeast(0.1f)
+                val sy = (fromScaleY + (toScaleY - fromScaleY) * p).coerceAtLeast(0.1f)
+                card.scaleX = sx
+                card.scaleY = sy
+                card.translationX = fromX + (toX - fromX) * p
+                card.translationY = fromY + (toY - fromY) * p
+
+                val visR = fromVisR + (toVisR - fromVisR) * pc
+                currentVisualCornerRadiusPx = visR
+                currentCornerRadiusPx = visR / sx
+                card.invalidateOutline()
+
+                scrimView?.alpha = fromScrim + (toScrim - fromScrim) * pc
+                glassRimView?.let { rim ->
+                    val rimA = fromRim + (toRim - fromRim) * pc
+                    rim.alpha = rimA
+                    if (rimA > 0.02f) rim.invalidate()
+                }
+            }
+            start()
+        }
+    }
+
+    private fun evalSpringRaw(u: Double, zeta: Double, omega0: Double, durationSec: Double): Double {
+        if (u <= 0.0) return 0.0
+        val t = u * durationSec
+        val decay = kotlin.math.exp(-zeta * omega0 * t)
+        return if (zeta < 1.0) {
+            val wd = omega0 * kotlin.math.sqrt(1.0 - zeta * zeta)
+            val coeff = zeta / kotlin.math.sqrt(1.0 - zeta * zeta)
+            1.0 - decay * (kotlin.math.cos(wd * t) + coeff * kotlin.math.sin(wd * t))
+        } else {
+            1.0 - decay * (1.0 + omega0 * t)
         }
     }
 
