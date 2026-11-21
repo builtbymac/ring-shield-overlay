@@ -791,29 +791,34 @@ class OverlayManager(private val context: Context) {
     private fun revealVideoOnFirstFrame(videoView: TextureViewRenderer) {
         val cfg = currentCfg ?: return
         hasFirstFrame = true
-        connectingPulseAnimator?.cancel()
-        connectingContainer?.animate()
-            ?.alpha(0f)
-            ?.scaleX(0.88f)
-            ?.scaleY(0.88f)
-            ?.setDuration(240L)
-            ?.setInterpolator(exitEase)
-            ?.withEndAction { connectingContainer?.visibility = View.GONE }
-            ?.start()
-
-        // Optical lens focus-settle reveal: video gently settles from 1.026x -> 1.0x as frost dissolves
+        // Optical lens focus-settle reveal: post on next animation frame so first-frame shader compile
+        // (especially under heavy 4K Dolby Vision GPU load) never eats the 320ms fade-in.
         videoView.scaleX = 1.026f
         videoView.scaleY = 1.026f
-        videoView.animate()
-            .alpha(1f)
-            .scaleX(1f)
-            .scaleY(1f)
-            .setDuration(320L)
-            .setInterpolator(enterEase)
-            .withEndAction {
-                connectingBackdrop?.visibility = View.GONE
-            }
-            .start()
+        videoView.postOnAnimation {
+            if (!isShowing || isHiding) return@postOnAnimation
+            connectingPulseAnimator?.cancel()
+            connectingContainer?.animate()
+                ?.alpha(0f)
+                ?.scaleX(0.88f)
+                ?.scaleY(0.88f)
+                ?.setDuration(240L)
+                ?.setInterpolator(exitEase)
+                ?.withLayer()
+                ?.withEndAction { connectingContainer?.visibility = View.GONE }
+                ?.start()
+
+            videoView.animate()
+                .alpha(1f)
+                .scaleX(1f)
+                .scaleY(1f)
+                .setDuration(320L)
+                .setInterpolator(enterEase)
+                .withEndAction {
+                    connectingBackdrop?.visibility = View.GONE
+                }
+                .start()
+        }
 
         if (!isKeepAlive) {
             scheduleAutoDismiss(cfg.overlayDurationSec * 1000L)
@@ -956,7 +961,7 @@ class OverlayManager(private val context: Context) {
             alpha = 0f
             translationY = -pipDockSlidePx
             visibility = View.GONE
-            elevation = pipDp(6, pipS).toFloat()
+            elevation = 0f
             layoutParams = FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.WRAP_CONTENT,
                 FrameLayout.LayoutParams.WRAP_CONTENT,
@@ -1002,7 +1007,7 @@ class OverlayManager(private val context: Context) {
             alpha = if (startFullscreen) 1f else 0f
             translationY = if (startFullscreen) 0f else -fsDockSlidePx
             visibility = if (startFullscreen) View.VISIBLE else View.GONE
-            elevation = expDp(8, expS).toFloat()
+            elevation = 0f
             layoutParams = FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.WRAP_CONTENT,
                 FrameLayout.LayoutParams.WRAP_CONTENT,
@@ -1151,6 +1156,7 @@ class OverlayManager(private val context: Context) {
         private var pressAnim: ValueAnimator? = null
         private var audioMorphAnim: ValueAnimator? = null
         private var waveAnim: ValueAnimator? = null
+        private var lastWaveDrawMs: Long = 0L
         private val slideEase = PathInterpolator(0.22f, 1.07f, 0.36f, 1f)
 
         private val dockBgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
@@ -1213,12 +1219,21 @@ class OverlayManager(private val context: Context) {
             } else {
                 audioMorph = target
             }
-            if (active) {
+            if (active && visibility == View.VISIBLE) {
                 startAudioWaveLoop()
             } else {
                 stopAudioWaveLoop()
             }
             invalidate()
+        }
+
+        override fun setVisibility(visibility: Int) {
+            super.setVisibility(visibility)
+            if (visibility == View.VISIBLE && audioActive) {
+                startAudioWaveLoop()
+            } else if (visibility != View.VISIBLE) {
+                stopAudioWaveLoop()
+            }
         }
 
         fun triggerPressBounce() {
@@ -1235,15 +1250,23 @@ class OverlayManager(private val context: Context) {
         }
 
         private fun startAudioWaveLoop() {
+            if (visibility != View.VISIBLE) return
             if (waveAnim?.isRunning == true) return
             waveAnim?.cancel()
+            lastWaveDrawMs = 0L
             waveAnim = ValueAnimator.ofFloat(0f, (Math.PI * 2.0).toFloat()).apply {
                 duration = 1350L
                 repeatCount = ValueAnimator.INFINITE
                 interpolator = LinearInterpolator()
                 addUpdateListener {
                     audioWavePhase = it.animatedValue as Float
-                    invalidate()
+                    // Throttle calm idle breathing redraws to ~20 fps to avoid unnecessary
+                    // 60 fps full-screen composites during heavy 4K Dolby Vision playback.
+                    val now = android.os.SystemClock.uptimeMillis()
+                    if (now - lastWaveDrawMs >= 48L) {
+                        lastWaveDrawMs = now
+                        invalidate()
+                    }
                 }
                 start()
             }
@@ -1526,18 +1549,18 @@ class OverlayManager(private val context: Context) {
                     val punch = kotlin.math.sin(m * Math.PI).toFloat()
                     val recoilX = -slotR * 0.055f * punch
                     val spkScale = 1f + 0.11f * punch
-                    val baseShiftX = -slotR * 0.06f
+                    val baseShiftX = -slotR * 0.10f
 
                     // Plump all-corners-rounded speaker silhouette (matches Apple SF Symbols / reference)
                     canvas.save()
                     canvas.translate(cx + baseShiftX + recoilX, cy)
                     canvas.scale(spkScale, spkScale)
 
-                    val spkLeft = -slotR * 0.38f
-                    val spkMid = -slotR * 0.17f
-                    val spkRight = slotR * 0.06f
-                    val boxH = slotR * 0.17f
-                    val coneH = slotR * 0.36f
+                    val spkLeft = -slotR * 0.36f
+                    val spkMid = -slotR * 0.16f
+                    val spkRight = slotR * 0.05f
+                    val boxH = slotR * 0.165f
+                    val coneH = slotR * 0.35f
                     val rBack = slotR * 0.085f
                     val rTip = slotR * 0.08f
 
@@ -1561,17 +1584,18 @@ class OverlayManager(private val context: Context) {
                     canvas.drawPath(speakerPath, iconFillPaint)
                     canvas.restore()
 
-                    val spkFaceX = cx + baseShiftX + slotR * 0.06f
+                    val spkFaceX = cx + baseShiftX + spkRight
                     val baseAlpha = Color.alpha(fgColor)
 
-                    // 1. Muted '×' on right side: twists 50° & collapses away cleanly during 0.0 -> 0.46
+                    // 1. Muted '×' on right side: clean breathing gap + compact proportions,
+                    //    twisting 50° & collapsing cleanly during 0.0 -> 0.46
                     if (m < 0.48f) {
                         val xProgress = (1f - (m / 0.46f)).coerceIn(0f, 1f)
                         val xScale = xProgress * (0.85f + 0.15f * xProgress)
                         val xRotDeg = (1f - xProgress) * 50f
-                        val xCx = cx + slotR * 0.25f
-                        val xHalf = slotR * 0.165f * xScale
-                        iconStrokePaint.strokeWidth = strokeUnitPx * 1.85f
+                        val xCx = cx + slotR * 0.28f
+                        val xHalf = slotR * 0.125f * xScale
+                        iconStrokePaint.strokeWidth = strokeUnitPx * 1.75f
                         iconStrokePaint.alpha = (baseAlpha * xProgress).toInt().coerceIn(0, 255)
                         canvas.save()
                         canvas.translate(xCx, cy)
@@ -1599,14 +1623,14 @@ class OverlayManager(private val context: Context) {
                             val r1 = slotR * 0.24f * (0.55f + 0.45f * t1)
                             val sweep1 = 80f * t1
                             iconStrokePaint.alpha = (baseAlpha * t1 * waveBreath1).toInt().coerceIn(0, 255)
-                            rect.set(spkFaceX - r1 * 0.25f, cy - r1, spkFaceX + r1 * 1.35f, cy + r1)
+                            rect.set(spkFaceX - r1 * 0.20f, cy - r1, spkFaceX + r1 * 1.40f, cy + r1)
                             canvas.drawArc(rect, -sweep1 * 0.5f, sweep1, false, iconStrokePaint)
                         }
                         if (t2 > 0.01f) {
-                            val r2 = slotR * 0.42f * (0.64f + 0.36f * t2)
+                            val r2 = slotR * 0.40f * (0.64f + 0.36f * t2)
                             val sweep2 = 88f * t2
                             iconStrokePaint.alpha = (baseAlpha * t2 * waveBreath2).toInt().coerceIn(0, 255)
-                            rect.set(spkFaceX - r2 * 0.25f, cy - r2, spkFaceX + r2 * 1.35f, cy + r2)
+                            rect.set(spkFaceX - r2 * 0.20f, cy - r2, spkFaceX + r2 * 1.40f, cy + r2)
                             canvas.drawArc(rect, -sweep2 * 0.5f, sweep2, false, iconStrokePaint)
                         }
                     }
@@ -1798,13 +1822,22 @@ class OverlayManager(private val context: Context) {
 
     private fun animateCornerRadius(card: FrameLayout, from: Float, to: Float, durationMs: Long) {
         cornerAnimator?.cancel()
+        var lastApplied = from
         cornerAnimator = ValueAnimator.ofFloat(from, to).apply {
             duration = durationMs
             interpolator = morphEase
             addUpdateListener { anim ->
-                currentCornerRadiusPx = anim.animatedValue as Float
-                card.invalidateOutline()
-                glassRimView?.invalidate()
+                val v = anim.animatedValue as Float
+                val isFinal = anim.animatedFraction >= 0.999f
+                // Avoid rebuilding the 1920x1080 clip outline & rim gradient for tiny sub-pixel deltas
+                if (isFinal || kotlin.math.abs(v - lastApplied) >= 3.0f) {
+                    lastApplied = v
+                    currentCornerRadiusPx = v
+                    card.invalidateOutline()
+                    if ((glassRimView?.alpha ?: 0f) > 0.02f) {
+                        glassRimView?.invalidate()
+                    }
+                }
             }
             start()
         }

@@ -114,29 +114,43 @@ class RelayClient(
             put("sdpOffer", sdpOffer)
         }.toString()
 
-        val reqBuilder = Request.Builder()
-            .url("${cfg.relayUrl}/api/whep/start")
-            .post(payload.toRequestBody(JSON_MEDIA_TYPE))
-        cfg.lanToken?.let { reqBuilder.header("Authorization", "Bearer $it") }
+        var lastError: Throwable? = null
+        for (attempt in 1..2) {
+            val reqBuilder = Request.Builder()
+                .url("${cfg.relayUrl}/api/whep/start")
+                .header("Connection", "close")
+                .post(payload.toRequestBody(JSON_MEDIA_TYPE))
+            cfg.lanToken?.let { reqBuilder.header("Authorization", "Bearer $it") }
 
-        http.newCall(reqBuilder.build()).execute().use { res ->
-            val bodyStr = res.body?.string().orEmpty()
-            if (!res.isSuccessful) {
-                error("Relay WHEP start HTTP ${res.code}: $bodyStr")
+            try {
+                return@withContext http.newCall(reqBuilder.build()).execute().use { res ->
+                    val bodyStr = res.body?.string().orEmpty()
+                    if (!res.isSuccessful) {
+                        error("Relay WHEP start HTTP ${res.code}: $bodyStr")
+                    }
+                    val json = JSONObject(bodyStr)
+                    WhepResponse(
+                        sdpAnswer = json.getString("sdpAnswer"),
+                        sessionUrl = if (json.isNull("sessionUrl")) null else json.optString("sessionUrl", "").takeIf { it.isNotBlank() && it != "null" },
+                        ringRttMs = if (json.has("ringRttMs") && !json.isNull("ringRttMs")) json.optDouble("ringRttMs") else null,
+                    )
+                }
+            } catch (io: java.io.IOException) {
+                lastError = io
+                Log.w(TAG, "WHEP start network error (attempt $attempt/2): ${io.message}")
+                if (attempt < 2) {
+                    kotlinx.coroutines.delay(180L)
+                }
             }
-            val json = JSONObject(bodyStr)
-            WhepResponse(
-                sdpAnswer = json.getString("sdpAnswer"),
-                sessionUrl = if (json.isNull("sessionUrl")) null else json.optString("sessionUrl", "").takeIf { it.isNotBlank() && it != "null" },
-                ringRttMs = if (json.has("ringRttMs") && !json.isNull("ringRttMs")) json.optDouble("ringRttMs") else null,
-            )
         }
+        throw lastError ?: java.io.IOException("WHEP start failed")
     }
 
     suspend fun stopWhep(sessionUrl: String) = withContext(Dispatchers.IO) {
         val payload = JSONObject().apply { put("sessionUrl", sessionUrl) }.toString()
         val reqBuilder = Request.Builder()
             .url("${cfg.relayUrl}/api/whep/stop")
+            .header("Connection", "close")
             .delete(payload.toRequestBody(JSON_MEDIA_TYPE))
         cfg.lanToken?.let { reqBuilder.header("Authorization", "Bearer $it") }
 
@@ -152,6 +166,7 @@ class RelayClient(
         }.toString()
         val reqBuilder = Request.Builder()
             .url("${cfg.relayUrl}/api/audio/app-mute")
+            .header("Connection", "close")
             .post(payload.toRequestBody(JSON_MEDIA_TYPE))
         cfg.lanToken?.let { reqBuilder.header("Authorization", "Bearer $it") }
 

@@ -6,7 +6,7 @@ import type { NormalizedRingEvent } from './webhook.js'
 export type OverlayCommandAction = 'show' | 'fullscreen' | 'toggle_fullscreen' | 'dismiss'
 
 interface AliveSocket extends WebSocket {
-  isAlive?: boolean
+  missedPongs?: number
   clientId?: string
 }
 
@@ -56,15 +56,20 @@ export class ShieldWsHub {
 
     this.wss.on('connection', (rawWs: WebSocket, req: IncomingMessage) => {
       const ws = rawWs as AliveSocket
-      ws.isAlive = true
+      ws.missedPongs = 0
       ws.clientId = req.socket.remoteAddress ?? 'unknown'
       console.log(`[ws] Shield connected (${ws.clientId}), total=${this.clientCount}`)
 
       ws.on('pong', () => {
-        ws.isAlive = true
+        ws.missedPongs = 0
+      })
+
+      ws.on('ping', () => {
+        ws.missedPongs = 0
       })
 
       ws.on('message', (data) => {
+        ws.missedPongs = 0
         try {
           const msg = JSON.parse(data.toString('utf8')) as {
             kind?: string
@@ -96,14 +101,18 @@ export class ShieldWsHub {
       ws.send(JSON.stringify({ kind: 'hello', server_ts_ms: Date.now() }))
     })
 
+    // Tolerate up to 3 consecutive missed pongs (60 s) so bursty 4K Dolby Vision Wi-Fi traffic
+    // on the Shield never causes false WebSocket resets.
     this.pingTimer = setInterval(() => {
       for (const rawWs of this.wss.clients) {
         const ws = rawWs as AliveSocket
-        if (ws.isAlive === false) {
+        const missed = ws.missedPongs ?? 0
+        if (missed >= 3) {
+          console.warn(`[ws] Terminating unresponsive Shield socket (${ws.clientId}) after ${missed} missed pongs`)
           ws.terminate()
           continue
         }
-        ws.isAlive = false
+        ws.missedPongs = missed + 1
         ws.ping()
       }
     }, 20_000)

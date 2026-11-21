@@ -366,6 +366,9 @@ async function main(): Promise<void> {
     }
   })
 
+  server.keepAliveTimeout = 65_000
+  server.headersTimeout = 66_000
+
   const hub = new ShieldWsHub(server, cfg.lanToken)
 
   const alexaHueEnabled = process.env.ALEXA_HUE_ENABLED !== 'false'
