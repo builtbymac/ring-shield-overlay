@@ -54,15 +54,12 @@ function checkLanAuth(req: http.IncomingMessage, lanToken?: string): boolean {
   return auth === lanToken
 }
 
-const ADB_BIN =
-  process.env.ADB_PATH ||
-  (process.platform === 'win32'
-    ? 'C:\\Users\\alexm\\AppData\\Local\\Android\\Sdk\\platform-tools\\adb.exe'
-    : 'adb')
-const SHIELD_SERIAL = process.env.SHIELD_ADB_SERIAL || '192.168.50.130:5555'
+const ADB_BIN = process.env.ADB_PATH?.trim() || 'adb'
+const SHIELD_SERIAL = process.env.SHIELD_ADB_SERIAL?.trim() || ''
 const mutedLiveTvPackages = new Set<string>()
 
 function connectShieldAdb(): Promise<void> {
+  if (!SHIELD_SERIAL) return Promise.resolve()
   return new Promise((resolve) => {
     execFile(ADB_BIN, ['connect', SHIELD_SERIAL], { timeout: 3000 }, (err, stdout) => {
       if (err) {
@@ -76,6 +73,7 @@ function connectShieldAdb(): Promise<void> {
 }
 
 function runAppOpsPlayAudio(pkg: string, mode: 'ignore' | 'allow'): Promise<Error | null> {
+  if (!SHIELD_SERIAL) return Promise.resolve(null)
   return new Promise((resolve) => {
     execFile(
       ADB_BIN,
@@ -87,6 +85,7 @@ function runAppOpsPlayAudio(pkg: string, mode: 'ignore' | 'allow'): Promise<Erro
 }
 
 async function setShieldPackageAudioMute(pkg: string, muted: boolean): Promise<void> {
+  if (!SHIELD_SERIAL) return
   if (!/^[a-zA-Z0-9_.]+$/.test(pkg) || pkg === 'com.builtbymac.ringshield') {
     return
   }

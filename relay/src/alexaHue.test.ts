@@ -13,7 +13,7 @@ test('AlexaHueBridge handles pairing, device discovery, and Shield command dispa
     },
   } as unknown as ShieldWsHub
 
-  const bridge = new AlexaHueBridge({ port: 0, hostIp: '192.168.50.172', hub: fakeHub })
+  const bridge = new AlexaHueBridge({ port: 0, hostIp: '192.168.1.50', hub: fakeHub })
   const server = http.createServer((req, res) => {
     void bridge.handleHttp(req, res)
   })
@@ -27,7 +27,7 @@ test('AlexaHueBridge handles pairing, device discovery, and Shield command dispa
     const descRes = await fetch(`${base}/description.xml`)
     assert.equal(descRes.status, 200)
     const xml = await descRes.text()
-    assert.match(xml, /Philips hue \(192\.168\.50\.172\)/)
+    assert.match(xml, /Philips hue \(192\.168\.1\.50\)/)
     assert.match(xml, /929000226503/)
 
     // 2. Echo pairing POST /api

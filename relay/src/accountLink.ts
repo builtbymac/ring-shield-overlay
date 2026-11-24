@@ -135,7 +135,7 @@ export class AccountLinker {
 
   /**
    * Step 2 (Browser redirect from Ring): validates `nonce` & `time` and renders a
-   * minimal, secure confirmation page for Alex to claim and finalize the link.
+   * minimal, secure confirmation page for the owner to claim and finalize the link.
    */
   renderLinkPage(nonce: string | null, timeParam: string | null): { status: number; html: string } {
     if (!nonce || !timeParam) {
